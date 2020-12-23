@@ -1,5 +1,5 @@
-lib_LTLIBRARIES = libslice-alloc.la
+lib_LTLIBRARIES = libslicealloc.la
 
 include_HEADERS = slice-alloc.h
 
-libslice_alloc_la_SOURCES = slice-alloc.c slice-alloc.h
+libslicealloc_la_SOURCES = slice-alloc.c slice-alloc.h

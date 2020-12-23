@@ -1345,12 +1345,12 @@ slice_cache_free(struct slice_cache *const cache, void *const ptr)
 	ASSERT(cache == hdr->cache);
 
 	if (span_is_singular(hdr)) {
-		// Handle a super-large chunk.
+		// Free super-large chunks.
 		span_destroy(hdr);
 		return;
 	}
 
-	// Handle a chunk in a regular span.
+	// Free chunks from regular spans.
 	struct slice_alloc_span *span = (struct slice_alloc_span *) hdr;
 	free_chunk(span, ptr);
 }
@@ -1371,14 +1371,14 @@ slice_cache_realloc(struct slice_cache *const cache, void *const ptr, const size
 	// Try to reuse the original chunk.
 	size_t old_size;
 	if (span_is_singular(hdr)) {
-		// Handle singular spans.
+		// Handle super-large chunks.
 		old_size = span_singular_size(hdr);
 		const struct singular_span_params params = span_compute_singular(size, ALIGNMENT);
 		if (old_size == (params.virtual_size - params.offset))
 			return ptr;
 		// TODO: use munmap to shorten singular spans.
 	} else {
-		// Handle regular chunks.
+		// Handle chunks from regular spans.
 		const uint32_t old_rank = get_chunk_rank(hdr, ptr);
 		const uint32_t rank = get_rank(size);
 		if (old_rank == rank)
@@ -1398,7 +1398,7 @@ slice_cache_realloc(struct slice_cache *const cache, void *const ptr, const size
 }
 
 size_t
-slice_alloc_size(const void *const ptr)
+slice_usable_size(const void *const ptr)
 {
 	if (ptr == NULL)
 		return 0;

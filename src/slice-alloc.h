@@ -69,6 +69,6 @@ void *
 slice_cache_realloc(struct slice_cache *const cache, void *const ptr, const size_t size);
 
 size_t
-slice_alloc_size(const void *const ptr);
+slice_usable_size(const void *const ptr);
 
 #endif /* SLICE_ALLOC_H */
