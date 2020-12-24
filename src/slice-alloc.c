@@ -1270,12 +1270,13 @@ get_chunk_size(const struct span_header *const hdr, const void *const ptr)
  **********************************************************************/
 
 static void
-handle_remote_free_list(struct slice_alloc_span *const span)
+handle_remote_free_list(struct slice_cache *const cache, struct slice_alloc_span *const span)
 {
 	for (;;) {
 		struct mpsc_qlink *link = mpsc_queue_remove(&span->remote_free_list);
 		if (link == NULL)
 			break;
+		cache->regular_free_num++;
 		free_chunk(span, link);
 	}
 }
@@ -1297,7 +1298,7 @@ slice_cache_collect_staging(struct slice_cache *const cache)
 	while (node != list_stub(&cache->staging)) {
 		struct slice_alloc_span *span = containerof(node, struct slice_alloc_span, staging_node);
 		struct slice_cache_node *next = node->next;
-		handle_remote_free_list(span);
+		handle_remote_free_list(cache, span);
 		if (span->alloc_num == span->free_num) {
 			list_delete(node);
 			span_destroy(&span->header);
@@ -1374,7 +1375,7 @@ void
 slice_cache_collect(struct slice_cache *const cache)
 {
 	// Try to free some slices in the active span.
-	handle_remote_free_list(cache->active);
+	handle_remote_free_list(cache, cache->active);
 
 	// Try to free some spans in the staging list.
 	slice_cache_collect_staging(cache);
@@ -1383,20 +1384,27 @@ slice_cache_collect(struct slice_cache *const cache)
 void *
 slice_cache_alloc(struct slice_cache *const cache, const size_t size)
 {
+	void *ptr;
+
 	const uint32_t rank = get_rank(size);
 	if (rank < CHUNK_RANKS) {
 		// Handle small amd medium sizes.
-		return alloc_chunk(cache, rank);
+		ptr = alloc_chunk(cache, rank);
 	} else if (rank < CACHE_RANKS) {
 		// Handle large sizes.
-		return alloc_slice(cache, rank, false);
+		ptr = alloc_slice(cache, rank, false);
 	} else {
 		// Handle super-large sizes.
 		struct span_header *hdr = span_create_singular(cache, size, ALIGNMENT);
 		if (unlikely(hdr == NULL))
 			return NULL;
+
+		cache->singular_alloc_num++;
 		return span_singular_data(hdr);
 	}
+
+	cache->regular_alloc_num += (ptr != NULL);
+	return ptr;
 }
 
 void *
@@ -1433,13 +1441,17 @@ slice_cache_aligned_alloc(struct slice_cache *const cache, const size_t alignmen
 			break;
 		}
 		if (alignment <= alloc_align) {
-			return alloc_chunk(cache, rank);
+			void *ptr = alloc_chunk(cache, rank);
+			cache->regular_alloc_num += (ptr != NULL);
+			return ptr;
 		}
 	} else if (rank < CACHE_RANKS) {
 		// Handle large sizes.
 		if (alignment <= UNIT_SIZE) {
 			// All slices are UNIT_SIZE-aligned.
-			return alloc_slice(cache, rank, false);
+			void *ptr = alloc_slice(cache, rank, false);
+			cache->regular_alloc_num += (ptr != NULL);
+			return ptr;
 		}
 	} else {
 		// Handle super-large sizes.
@@ -1447,6 +1459,8 @@ slice_cache_aligned_alloc(struct slice_cache *const cache, const size_t alignmen
 							       max(alignment, ALIGNMENT));
 		if (unlikely(hdr == NULL))
 			return NULL;
+
+		cache->singular_alloc_num++;
 		return span_singular_data(hdr);
 	}
 
@@ -1466,12 +1480,14 @@ slice_cache_free(struct slice_cache *const cache, void *const ptr)
 
 	if (span_is_singular(hdr)) {
 		// Free super-large chunks.
+		atomic_fetch_add_explicit(&cache->singular_free_num, 1, memory_order_relaxed);
 		span_destroy(hdr);
 		return;
 	}
 
 	// Free chunks from regular spans.
 	struct slice_alloc_span *span = (struct slice_alloc_span *) hdr;
+	cache->regular_free_num++;
 	free_chunk(span, ptr);
 }
 
@@ -1576,6 +1592,7 @@ slice_cache_remote_free(struct span_header *const hdr, void *const ptr)
 
 	// Handle a singular span.
 	if (span_is_singular(hdr)) {
+		atomic_fetch_add_explicit(&hdr->cache->singular_free_num, 1, memory_order_relaxed);
 		span_destroy(hdr);
 		return;
 	}
