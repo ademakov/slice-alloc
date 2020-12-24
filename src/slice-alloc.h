@@ -23,6 +23,13 @@
 #define SLICE_ALLOC_H
 
 #include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+struct slice_cache;
 
 struct slice_cache_node
 {
@@ -36,6 +43,13 @@ struct slice_cache_list
 };
 
 /*
+ * Cache release callback. It is safe to destroy a cache only
+ * after the last memory chunk from it is released. Thus this
+ * callback is used to notify about this event.
+ */
+typedef void (*slice_cache_release_t)(struct slice_cache *cache, void *data);
+
+/*
  * A memory allocation cache.
  */
 struct slice_cache
@@ -45,13 +59,26 @@ struct slice_cache
 
 	/* Inactive spans to gather freed memory. */
 	struct slice_cache_list staging;
+
+	/* Release list node.*/
+	struct slice_cache_node release_node;
+	/* Release callback. */
+	slice_cache_release_t release_callback;
+	/* Release callback user data. */
+	void *release_callback_data;
+
+	/* Statistics. */
+	uint64_t regular_alloc_num;
+	uint64_t regular_free_num;
+	uint64_t singular_alloc_num;
+	uint64_t _Atomic singular_free_num;
 };
 
 void
 slice_cache_prepare(struct slice_cache *cache);
 
 void
-slice_cache_cleanup(struct slice_cache *cache);
+slice_cache_cleanup(struct slice_cache *cache, slice_cache_release_t cb, void *cb_data);
 
 void
 slice_cache_collect(struct slice_cache *cache);
@@ -70,5 +97,12 @@ slice_cache_realloc(struct slice_cache *const cache, void *const ptr, const size
 
 size_t
 slice_usable_size(const void *const ptr);
+
+void
+slice_scrap_collect(void);
+
+#ifdef __cplusplus
+} // extern "C"
+#endif
 
 #endif /* SLICE_ALLOC_H */

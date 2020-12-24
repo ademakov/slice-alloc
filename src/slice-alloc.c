@@ -24,9 +24,8 @@
 #include <errno.h>
 #include <stdatomic.h>
 #include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
 #include <stdlib.h>
+#include <stdnoreturn.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -76,7 +75,7 @@
 #define ASSERT(e)	(likely(e) ? (void) 0 : panic("panic: " LOCATION ": assertion failed\n"))
 #define VERIFY(e, msg)	(likely(e) ? (void) 0 : panic("panic: " LOCATION ": " msg "\n"))
 
-static void __attribute__((__noreturn__))
+static void noreturn
 panic(const char *msg)
 {
 	size_t len = strlen(msg);
@@ -144,6 +143,53 @@ panic(const char *msg)
 		typeof(p) _p = (p);			\
 		(_x + _p - 1) & ~(_p - 1);		\
 	})
+
+/**********************************************************************
+ * Spin lock.
+ **********************************************************************/
+
+#define SPINLOCK_INIT { ATOMIC_VAR_INIT(false) }
+
+typedef struct CACHE_ALIGN
+{
+	atomic_bool lock;
+} spinlock_t;
+
+static inline void
+spin_pause(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+	__builtin_ia32_pause();
+#endif
+}
+
+static inline bool
+spin_is_locked(spinlock_t *lock)
+{
+	return atomic_load_explicit(&lock->lock, memory_order_relaxed);
+}
+
+static inline bool
+spin_try_lock(spinlock_t *lock)
+{
+	return !atomic_exchange_explicit(&lock->lock, true, memory_order_acquire);
+}
+
+static inline void
+spin_lock(spinlock_t *lock)
+{
+	while (!spin_try_lock(lock)) {
+		do
+			spin_pause();
+		while (spin_is_locked(lock));
+	}
+}
+
+static inline void
+spin_unlock(spinlock_t *lock)
+{
+	atomic_store_explicit(&lock->lock, false, memory_order_release);
+}
 
 /**********************************************************************
  * MPSC concurrent queue.
@@ -224,6 +270,82 @@ mpsc_queue_remove(struct mpsc_queue *list)
 		return head;
 	}
 	return NULL;
+}
+
+/**********************************************************************
+ * Double linked lists.
+ **********************************************************************/
+
+static inline void
+list_prepare(struct slice_cache_list *list)
+{
+	list->node.next = list->node.prev = &list->node;
+}
+
+static inline const struct slice_cache_node *
+list_stub(const struct slice_cache_list *list)
+{
+	return &list->node;
+}
+
+static inline struct slice_cache_node *
+list_head(struct slice_cache_list *list)
+{
+	return list->node.next;
+}
+
+static inline struct slice_cache_node *
+list_tail(struct slice_cache_list *list)
+{
+	return list->node.prev;
+}
+
+static inline bool
+list_empty(const struct slice_cache_list *list)
+{
+	return list->node.next == list_stub(list);
+}
+
+static inline void
+list_delete(struct slice_cache_node *node)
+{
+	node->prev->next = node->next;
+	node->next->prev = node->prev;
+}
+
+static inline void
+list_splice_after(struct slice_cache_node *node, struct slice_cache_node *head, struct slice_cache_node *tail)
+{
+	head->prev = node;
+	tail->next = node->next;
+	node->next->prev = tail;
+	node->next = head;
+}
+
+static inline void
+list_insert_after(struct slice_cache_node *node, struct slice_cache_node *node2)
+{
+	list_splice_after(node, node2, node2);
+}
+
+static inline void
+list_splice_first(struct slice_cache_list *list, struct slice_cache_node *head, struct slice_cache_node *tail)
+{
+	list_splice_after(&list->node, head, tail);
+}
+
+static inline void
+list_insert_first(struct slice_cache_list *list, struct slice_cache_node *node)
+{
+	list_insert_after(&list->node, node);
+}
+
+static inline struct slice_cache_node *
+list_remove_first(struct slice_cache_list *list)
+{
+	struct slice_cache_node *head = list_head(list);
+	list_delete(head);
+	return head;
 }
 
 /**********************************************************************
@@ -423,76 +545,6 @@ span_destroy(struct span_header *const hdr)
 }
 
 /**********************************************************************
- * Regular span lists.
- **********************************************************************/
-
-static inline void
-list_prepare(struct slice_cache_list *list)
-{
-	list->node.next = list->node.prev = &list->node;
-}
-
-static inline const struct slice_cache_node *
-list_stub(const struct slice_cache_list *list)
-{
-	return &list->node;
-}
-
-static inline struct slice_cache_node *
-list_head(struct slice_cache_list *list)
-{
-	return list->node.next;
-}
-
-static inline struct slice_cache_node *
-list_tail(struct slice_cache_list *list)
-{
-	return list->node.prev;
-}
-
-static inline bool
-list_empty(const struct slice_cache_list *list)
-{
-	return list->node.next == list_stub(list);
-}
-
-static inline void
-list_delete(struct slice_cache_node *node)
-{
-	node->prev->next = node->next;
-	node->next->prev = node->prev;
-}
-
-static inline void
-list_splice_after(struct slice_cache_node *node, struct slice_cache_node *head, struct slice_cache_node *tail)
-{
-	head->prev = node;
-	tail->next = node->next;
-	node->next->prev = tail;
-	node->next = head;
-}
-
-static inline void
-list_insert_after(struct slice_cache_node *node, struct slice_cache_node *node2)
-{
-	list_splice_after(node, node2, node2);
-}
-
-static inline void
-list_insert_first(struct slice_cache_list *list, struct slice_cache_node *node)
-{
-	list_insert_after(&list->node, node);
-}
-
-static inline struct slice_cache_node *
-list_remove_first(struct slice_cache_list *list)
-{
-	struct slice_cache_node *head = list_head(list);
-	list_delete(head);
-	return head;
-}
-
-/**********************************************************************
  * Regular memory spans.
  **********************************************************************/
 
@@ -590,6 +642,10 @@ struct slice_alloc_span
 
 	struct slice_cache_node staging_node;
 	span_status_t status;
+
+	/* Statistics. */
+	uint64_t alloc_num;
+	uint64_t free_num;
 
 	// The list of chunks freed remotely.
 	struct mpsc_queue remote_free_list;
@@ -870,6 +926,8 @@ prepare_span(struct slice_alloc_span *const span)
 	// to zero it out manually.
 #if 0
 	span->status = SPAN_ACTIVE;
+	span->alloc_num = 0;
+	span->free_num = 0;
 
 	for (uint32_t i = 0; i < CHUNK_RANKS; i++)
 		span->blocks[i] = NULL;
@@ -1207,6 +1265,10 @@ get_chunk_size(const struct span_header *const hdr, const void *const ptr)
 	return memory_sizes[rank];
 }
 
+/**********************************************************************
+ * Slice cache management.
+ **********************************************************************/
+
 static void
 handle_remote_free_list(struct slice_alloc_span *const span)
 {
@@ -1218,9 +1280,53 @@ handle_remote_free_list(struct slice_alloc_span *const span)
 	}
 }
 
+static bool
+slice_cache_all_free(const struct slice_cache *const cache)
+{
+	if (cache->regular_alloc_num != cache->regular_free_num)
+		return false;
+	if (cache->singular_alloc_num != atomic_load_explicit(&cache->singular_free_num, memory_order_relaxed))
+		return false;
+	return true;
+}
+
+static void
+slice_cache_collect_staging(struct slice_cache *const cache)
+{
+	struct slice_cache_node *node = list_head(&cache->staging);
+	while (node != list_stub(&cache->staging)) {
+		struct slice_alloc_span *span = containerof(node, struct slice_alloc_span, staging_node);
+		struct slice_cache_node *next = node->next;
+		handle_remote_free_list(span);
+		if (span->alloc_num == span->free_num) {
+			list_delete(node);
+			span_destroy(&span->header);
+		}
+		node = next;
+	}
+}
+
+static void
+slice_cache_release(struct slice_cache *const cache)
+{
+	if (cache->release_callback != NULL) {
+		(cache->release_callback)(cache, cache->release_callback_data);
+	}
+}
+
 /**********************************************************************
- * Public API.
+ * Slice cache management - public API.
  **********************************************************************/
+
+/* Pending cache release list. */
+static struct slice_cache_list slice_cache_release_list = {
+	.node = {
+		.next = &slice_cache_release_list.node,
+		.prev = &slice_cache_release_list.node,
+	}
+};
+
+static spinlock_t slice_cache_release_list_lock = SPINLOCK_INIT;
 
 void
 slice_cache_prepare(struct slice_cache *const cache)
@@ -1230,34 +1336,48 @@ slice_cache_prepare(struct slice_cache *const cache)
 	cache->active = (struct slice_alloc_span *) span_create_regular(cache);
 	VERIFY(cache->active, "failed to create an initial memory span");
 	prepare_span(cache->active);
+
+	cache->regular_alloc_num = 0;
+	cache->regular_free_num = 0;
+	cache->singular_alloc_num = 0;
+	cache->singular_free_num = 0;
 }
 
 void
-slice_cache_cleanup(struct slice_cache *const cache)
+slice_cache_cleanup(struct slice_cache *const cache, slice_cache_release_t cb, void *cb_data)
 {
-	while (!list_empty(&cache->staging)) {
-		struct slice_cache_node *node = list_remove_first(&cache->staging);
-		struct slice_alloc_span *span = containerof(node, struct slice_alloc_span, staging_node);
-		span_destroy(&span->header);
+	// Store the release callback.
+	cache->release_callback = cb;
+	cache->release_callback_data = cb_data;
+
+	// Move the active span to the staging list.
+	if (cache->active != NULL) {
+		list_insert_first(&cache->staging, &cache->active->staging_node);
+		cache->active->status = SPAN_STAGING;
+		cache->active = NULL;
 	}
 
-	if (cache->active != NULL) {
-		span_destroy(&cache->active->header);
-		cache->active = NULL;
+	// Try to free all the spans in the staging list.
+	slice_cache_collect_staging(cache);
+	if (slice_cache_all_free(cache)) {
+		// If done then release the cache immediately.
+		slice_cache_release(cache);
+	} else {
+		// If not then keep the cache around for a while.
+		spin_lock(&slice_cache_release_list_lock);
+		list_insert_first(&slice_cache_release_list, &cache->release_node);
+		spin_unlock(&slice_cache_release_list_lock);
 	}
 }
 
 void
 slice_cache_collect(struct slice_cache *const cache)
 {
+	// Try to free some slices in the active span.
 	handle_remote_free_list(cache->active);
 
-	struct slice_cache_node *node = list_head(&cache->staging);
-	while (node != list_stub(&cache->staging)) {
-		struct slice_alloc_span *span = containerof(node, struct slice_alloc_span, staging_node);
-		handle_remote_free_list(span);
-		node = node->next;
-	}
+	// Try to free some spans in the staging list.
+	slice_cache_collect_staging(cache);
 }
 
 void *
@@ -1413,7 +1533,40 @@ slice_usable_size(const void *const ptr)
 	return get_chunk_size(hdr, ptr);
 }
 
+void
+slice_scrap_collect(void)
+{
+	struct slice_cache_list list;
+	list_prepare(&list);
 
+	if (spin_try_lock(&slice_cache_release_list_lock)) {
+		list_splice_first(&list,
+				  list_head(&slice_cache_release_list),
+				  list_tail(&slice_cache_release_list));
+		list_prepare(&slice_cache_release_list);
+		spin_unlock(&slice_cache_release_list_lock);
+
+		struct slice_cache_node *node = list_head(&list);
+		while (node != list_stub(&list)) {
+			struct slice_cache *cache = containerof(node, struct slice_cache, release_node);
+			struct slice_cache_node *next = node->next;
+			slice_cache_collect_staging(cache);
+			if (slice_cache_all_free(cache)) {
+				list_delete(node);
+				slice_cache_release(cache);
+			}
+			node = next;
+		}
+
+		if (!list_empty(&list)) {
+			spin_lock(&slice_cache_release_list_lock);
+			list_splice_first(&slice_cache_release_list,
+					  list_head(&list),
+					  list_tail(&list));
+			spin_unlock(&slice_cache_release_list_lock);
+		}
+	}
+}
 
 /* TODO: enhance this part of API */
 void
@@ -1433,4 +1586,3 @@ slice_cache_remote_free(struct span_header *const hdr, void *const ptr)
 	struct slice_alloc_span *span = (struct slice_alloc_span *) hdr;
 	mpsc_queue_append(&span->remote_free_list, link);
 }
-
