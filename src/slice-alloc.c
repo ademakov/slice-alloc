@@ -1006,6 +1006,9 @@ alloc_slice(struct slice_cache *const cache, const uint32_t required_rank, const
 		// The slice is to be used as such.
 		span->units[base + 1] = 0;
 		span->units[base + 2] = 0;
+
+		span->alloc_num++;
+		cache->regular_alloc_num++;
 	} else {
 		// The slice is to be used as a block. Fill the unit map.
 		const uint8_t bytes[4] = {
@@ -1078,6 +1081,9 @@ alloc_chunk(struct slice_cache *const cache, const uint32_t rank)
 				// Remove a fully used block.
 				cache->active->blocks[rank] = block->next;
 			}
+
+			cache->active->alloc_num++;
+			cache->regular_alloc_num++;
 			return (uint8_t *) block + shift * memory_sizes[rank];
 		}
 
@@ -1085,6 +1091,9 @@ alloc_chunk(struct slice_cache *const cache, const uint32_t rank)
 		block = alloc_block(cache, rank + OUTER_TO_SLICE);
 		if (unlikely(block == NULL))
 			return NULL;
+
+		cache->active->alloc_num++;
+		cache->regular_alloc_num++;
 		return (uint8_t *) block + memory_sizes[rank];
 
 	} else {
@@ -1110,6 +1119,8 @@ alloc_chunk(struct slice_cache *const cache, const uint32_t rank)
 				}
 			}
 
+			cache->active->alloc_num++;
+			cache->regular_alloc_num++;
 			return inner_base + inner_shift * memory_sizes[rank];
 		}
 
@@ -1148,13 +1159,18 @@ alloc_chunk(struct slice_cache *const cache, const uint32_t rank)
 		cache->active->blocks[rank] = block;
 		block->inner_next = NULL;
 
+		cache->active->alloc_num++;
+		cache->regular_alloc_num++;
 		return inner_base + memory_sizes[rank];
 	}
 }
 
 static void
-free_chunk(struct slice_alloc_span *const span, void *const ptr)
+free_chunk(struct slice_cache *const cache, struct slice_alloc_span *const span, void *const ptr)
 {
+	span->free_num++;
+	cache->regular_free_num++;
+
 	// Identify the chunk.
 	const uint32_t base = deduce_base(span, ptr);
 	VERIFY(base >= 4 && base < UNIT_NUMBER, "bad pointer");
@@ -1278,8 +1294,7 @@ handle_remote_free_list(struct slice_cache *const cache, struct slice_alloc_span
 		struct mpsc_qlink *link = mpsc_queue_remove(&span->remote_free_list);
 		if (link == NULL)
 			break;
-		cache->regular_free_num++;
-		free_chunk(span, link);
+		free_chunk(cache, span, link);
 	}
 }
 
@@ -1386,15 +1401,13 @@ slice_cache_collect(struct slice_cache *const cache)
 void *
 slice_cache_alloc(struct slice_cache *const cache, const size_t size)
 {
-	void *ptr;
-
 	const uint32_t rank = get_rank(size);
 	if (rank < CHUNK_RANKS) {
 		// Handle small amd medium sizes.
-		ptr = alloc_chunk(cache, rank);
+		return alloc_chunk(cache, rank);
 	} else if (rank < CACHE_RANKS) {
 		// Handle large sizes.
-		ptr = alloc_slice(cache, rank, false);
+		return alloc_slice(cache, rank, false);
 	} else {
 		// Handle super-large sizes.
 		struct span_header *hdr = span_create_singular(cache, size, ALIGNMENT);
@@ -1404,9 +1417,6 @@ slice_cache_alloc(struct slice_cache *const cache, const size_t size)
 		cache->singular_alloc_num++;
 		return span_singular_data(hdr);
 	}
-
-	cache->regular_alloc_num += (ptr != NULL);
-	return ptr;
 }
 
 void *
@@ -1443,17 +1453,13 @@ slice_cache_aligned_alloc(struct slice_cache *const cache, const size_t alignmen
 			break;
 		}
 		if (alignment <= alloc_align) {
-			void *ptr = alloc_chunk(cache, rank);
-			cache->regular_alloc_num += (ptr != NULL);
-			return ptr;
+			return alloc_chunk(cache, rank);
 		}
 	} else if (rank < CACHE_RANKS) {
 		// Handle large sizes.
 		if (alignment <= UNIT_SIZE) {
 			// All slices are UNIT_SIZE-aligned.
-			void *ptr = alloc_slice(cache, rank, false);
-			cache->regular_alloc_num += (ptr != NULL);
-			return ptr;
+			return alloc_slice(cache, rank, false);
 		}
 	} else {
 		// Handle super-large sizes.
@@ -1489,8 +1495,7 @@ slice_cache_free(struct slice_cache *const cache, void *const ptr)
 
 	// Free chunks from regular spans.
 	struct slice_alloc_span *const span = (struct slice_alloc_span *) hdr;
-	cache->regular_free_num++;
-	free_chunk(span, ptr);
+	free_chunk(cache, span, ptr);
 }
 
 void
@@ -1509,8 +1514,7 @@ slice_cache_free_maybe_remotely(struct slice_cache *const local_cache, void *con
 	struct slice_alloc_span *const span = (struct slice_alloc_span *) hdr;
 	if (hdr->cache == local_cache) {
 		// Nice, this is a local free actually.
-		local_cache->regular_free_num++;
-		free_chunk(span, ptr);
+		free_chunk(local_cache, span, ptr);
 	} else {
 		// Well, this is really a remote free.
 		struct mpsc_qlink *const link = ptr;
