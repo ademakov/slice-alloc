@@ -16,7 +16,11 @@ static void *
 thread_test(void *arg)
 {
 	test();
-	return arg == NULL ? NULL : slice_alloc(100);
+	if (arg != NULL) {
+		arg = slice_alloc(100);
+		printf("%p\n", arg);
+	}
+	return arg;
 }
 
 int
@@ -40,7 +44,7 @@ main(int ac, char **av)
 		pthread_join(tid, &ret);
 		slice_free(ret);
 
-//		slice_scrap_collect();
+		slice_scrap_collect();
 	}
 
 	return 0;
