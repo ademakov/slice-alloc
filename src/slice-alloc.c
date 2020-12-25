@@ -1693,7 +1693,7 @@ slice_local_collect(void)
 }
 
 void *
-slice_alloc(size_t size)
+slice_alloc(const size_t size)
 {
 	struct slice_cache *cache = get_local_cache();
 	if (unlikely(cache == NULL))

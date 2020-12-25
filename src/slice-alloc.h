@@ -87,19 +87,19 @@ void *
 slice_cache_alloc(struct slice_cache *cache, size_t size);
 
 void *
-slice_cache_aligned_alloc(struct slice_cache *const cache, const size_t alignment, const size_t size);
+slice_cache_aligned_alloc(struct slice_cache *cache, size_t alignment, size_t size);
 
 void
-slice_cache_free(struct slice_cache *const cache, void *const ptr);
+slice_cache_free(struct slice_cache *cache, void *ptr);
 
 void
-slice_cache_free_maybe_remotely(struct slice_cache *const local_cache, void *const ptr);
+slice_cache_free_maybe_remotely(struct slice_cache *local_cache, void *ptr);
 
 void *
-slice_cache_realloc(struct slice_cache *const cache, void *const ptr, const size_t size);
+slice_cache_realloc(struct slice_cache *cache, void *ptr, size_t size);
 
 size_t
-slice_usable_size(const void *const ptr);
+slice_usable_size(const void *ptr);
 
 void
 slice_scrap_collect(void);
@@ -111,13 +111,13 @@ void *
 slice_alloc(size_t size);
 
 void *
-slice_aligned_alloc(const size_t alignment, const size_t size);
+slice_aligned_alloc(size_t alignment, size_t size);
 
 void
-slice_free(void *const ptr);
+slice_free(void *ptr);
 
 void *
-slice_realloc(void *const ptr, const size_t size);
+slice_realloc(void *ptr, size_t size);
 
 #ifdef __cplusplus
 } // extern "C"
