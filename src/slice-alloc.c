@@ -29,6 +29,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <pthread.h>
+
 #include <sys/mman.h>
 
 /**********************************************************************
@@ -1559,6 +1561,10 @@ slice_cache_realloc(struct slice_cache *const cache, void *const ptr, const size
 	return new_ptr;
 }
 
+/**********************************************************************
+ * Common functions - public API.
+ **********************************************************************/
+
 void
 slice_scrap_collect(void)
 {
@@ -1608,4 +1614,114 @@ slice_usable_size(const void *const ptr)
 
 	// Handle a chunk in a regular span.
 	return get_chunk_size(hdr, ptr);
+}
+
+/**********************************************************************
+ * Thread-specific memory management - public API.
+ **********************************************************************/
+
+// Thread-local cache.
+static __thread struct slice_cache *local_cache = NULL;
+
+// This is used for thread-local cache cleanup.
+static pthread_key_t local_cache_key;
+static pthread_once_t local_cache_once = PTHREAD_ONCE_INIT;
+
+// Initial cache used for bootstrapping.
+static struct slice_cache initial_cache;
+
+static void
+release_local_cache(struct slice_cache *cache, void *data __attribute__((unused)))
+{
+	if (cache != &initial_cache) {
+		slice_cache_free(&initial_cache, cache);
+	} else {
+		pthread_key_delete(local_cache_key);
+	}
+	slice_scrap_collect();
+}
+
+static void
+destroy_local_cache(void *ptr)
+{
+	slice_cache_cleanup((struct slice_cache *) ptr, release_local_cache, NULL);
+}
+
+static void
+prepare_local_cache(void)
+{
+	// Create initial cache.
+	slice_cache_prepare(&initial_cache);
+	local_cache = &initial_cache;
+
+	// Create the key needed for cleanup.
+	pthread_key_create(&local_cache_key, destroy_local_cache);
+}
+
+static struct slice_cache *
+get_local_cache(void)
+{
+	struct slice_cache *cache = local_cache;
+	if (unlikely(cache == NULL)) {
+		// Initialize local cache global data if needed.
+		pthread_once(&local_cache_once, prepare_local_cache);
+
+		// Create a new cache unless the slice_cache_boot cache has
+		// just been initialized in this thread.
+		cache = local_cache;
+		if (likely(cache == NULL)) {
+			cache = slice_cache_alloc(&initial_cache, sizeof(struct slice_cache));
+			if (cache == NULL)
+				return NULL;
+			slice_cache_prepare(cache);
+			local_cache = cache;
+		}
+
+		// This is only for cleanup. We don't use pthread_getspecific().
+		pthread_setspecific(local_cache_key, cache);
+	}
+	return cache;
+}
+
+void
+slice_local_collect(void)
+{
+	struct slice_cache *cache = get_local_cache();
+	if (unlikely(cache == NULL))
+		return;
+	slice_cache_collect(cache);
+}
+
+void *
+slice_alloc(size_t size)
+{
+	struct slice_cache *cache = get_local_cache();
+	if (unlikely(cache == NULL))
+		return NULL;
+	return slice_cache_alloc(cache, size);
+}
+
+void *
+slice_aligned_alloc(const size_t alignment, const size_t size)
+{
+	struct slice_cache *cache = get_local_cache();
+	if (unlikely(cache == NULL))
+		return NULL;
+	return slice_cache_aligned_alloc(cache, alignment, size);
+}
+
+void
+slice_free(void *const ptr)
+{
+	struct slice_cache *cache = get_local_cache();
+	slice_cache_free_maybe_remotely(cache, ptr);
+}
+
+void *
+slice_realloc(void *const ptr, const size_t size)
+{
+	struct slice_cache *cache = get_local_cache();
+	if (unlikely(cache == NULL))
+		return NULL;
+	return slice_cache_realloc(cache, ptr, size);
 }

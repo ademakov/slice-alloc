@@ -104,6 +104,21 @@ slice_usable_size(const void *const ptr);
 void
 slice_scrap_collect(void);
 
+void
+slice_local_collect(void);
+
+void *
+slice_alloc(size_t size);
+
+void *
+slice_aligned_alloc(const size_t alignment, const size_t size);
+
+void
+slice_free(void *const ptr);
+
+void *
+slice_realloc(void *const ptr, const size_t size);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
