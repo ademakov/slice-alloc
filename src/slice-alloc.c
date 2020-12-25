@@ -1486,9 +1486,35 @@ slice_cache_free(struct slice_cache *const cache, void *const ptr)
 	}
 
 	// Free chunks from regular spans.
-	struct slice_alloc_span *span = (struct slice_alloc_span *) hdr;
+	struct slice_alloc_span *const span = (struct slice_alloc_span *) hdr;
 	cache->regular_free_num++;
 	free_chunk(span, ptr);
+}
+
+void
+slice_cache_free_maybe_remotely(struct slice_cache *const local_cache, void *const ptr)
+{
+	struct span_header *const hdr = span_from_ptr(ptr);
+
+	if (span_is_singular(hdr)) {
+		// Free super-large chunks.
+		atomic_fetch_add_explicit(&hdr->cache->singular_free_num, 1, memory_order_relaxed);
+		span_destroy(hdr);
+		return;
+	}
+
+	// Free chunks from regular spans.
+	struct slice_alloc_span *const span = (struct slice_alloc_span *) hdr;
+	if (hdr->cache == local_cache) {
+		// Nice, this is a local free actually.
+		local_cache->regular_free_num++;
+		free_chunk(span, ptr);
+	} else {
+		// Well, this is really a remote free.
+		struct mpsc_qlink *const link = ptr;
+		mpsc_qlink_prepare(link);
+		mpsc_queue_append(&span->remote_free_list, link);
+	}
 }
 
 void *
@@ -1533,22 +1559,6 @@ slice_cache_realloc(struct slice_cache *const cache, void *const ptr, const size
 	return new_ptr;
 }
 
-size_t
-slice_usable_size(const void *const ptr)
-{
-	if (ptr == NULL)
-		return 0;
-
-	const struct span_header *const hdr = span_from_ptr(ptr);
-	if (span_is_singular(hdr)) {
-		// Handle a super-large chunk.
-		return span_singular_size(hdr);
-	}
-
-	// Handle a chunk in a regular span.
-	return get_chunk_size(hdr, ptr);
-}
-
 void
 slice_scrap_collect(void)
 {
@@ -1584,22 +1594,18 @@ slice_scrap_collect(void)
 	}
 }
 
-/* TODO: enhance this part of API */
-void
-slice_cache_remote_free(struct span_header *const hdr, void *const ptr)
+size_t
+slice_usable_size(const void *const ptr)
 {
-	ASSERT(hdr == span_from_ptr(ptr));
+	if (ptr == NULL)
+		return 0;
 
-	// Handle a singular span.
+	const struct span_header *const hdr = span_from_ptr(ptr);
 	if (span_is_singular(hdr)) {
-		atomic_fetch_add_explicit(&hdr->cache->singular_free_num, 1, memory_order_relaxed);
-		span_destroy(hdr);
-		return;
+		// Handle a super-large chunk.
+		return span_singular_size(hdr);
 	}
 
-	// Handle a chunk in a heap span.
-	struct mpsc_qlink *const link = ptr;
-	mpsc_qlink_prepare(link);
-	struct slice_alloc_span *span = (struct slice_alloc_span *) hdr;
-	mpsc_queue_append(&span->remote_free_list, link);
+	// Handle a chunk in a regular span.
+	return get_chunk_size(hdr, ptr);
 }

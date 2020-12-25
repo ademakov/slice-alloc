@@ -92,6 +92,9 @@ slice_cache_aligned_alloc(struct slice_cache *const cache, const size_t alignmen
 void
 slice_cache_free(struct slice_cache *const cache, void *const ptr);
 
+void
+slice_cache_free_maybe_remotely(struct slice_cache *const local_cache, void *const ptr);
+
 void *
 slice_cache_realloc(struct slice_cache *const cache, void *const ptr, const size_t size);
 
