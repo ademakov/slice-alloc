@@ -1572,10 +1572,12 @@ slice_scrap_collect(void)
 	list_prepare(&list);
 
 	if (spin_try_lock(&slice_cache_release_list_lock)) {
-		list_splice_first(&list,
-				  list_head(&slice_cache_release_list),
-				  list_tail(&slice_cache_release_list));
-		list_prepare(&slice_cache_release_list);
+		if (!list_empty(&slice_cache_release_list)) {
+			list_splice_first(&list,
+					  list_head(&slice_cache_release_list),
+					  list_tail(&slice_cache_release_list));
+			list_prepare(&slice_cache_release_list);
+		}
 		spin_unlock(&slice_cache_release_list_lock);
 
 		struct slice_cache_node *node = list_head(&list);
@@ -1710,13 +1712,6 @@ slice_aligned_alloc(const size_t alignment, const size_t size)
 	return slice_cache_aligned_alloc(cache, alignment, size);
 }
 
-void
-slice_free(void *const ptr)
-{
-	struct slice_cache *cache = get_local_cache();
-	slice_cache_free_maybe_remotely(cache, ptr);
-}
-
 void *
 slice_realloc(void *const ptr, const size_t size)
 {
@@ -1724,4 +1719,10 @@ slice_realloc(void *const ptr, const size_t size)
 	if (unlikely(cache == NULL))
 		return NULL;
 	return slice_cache_realloc(cache, ptr, size);
+}
+
+void
+slice_free(void *const ptr)
+{
+	slice_cache_free_maybe_remotely(local_cache, ptr);
 }
