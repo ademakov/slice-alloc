@@ -146,6 +146,7 @@ panic(const char *msg)
 		(_x + _p - 1) & ~(_p - 1);		\
 	})
 
+
 /**********************************************************************
  * Spin lock.
  **********************************************************************/
@@ -469,8 +470,7 @@ span_alloc_space(const size_t size, const size_t addr_mask)
 
 		const size_t upsized_size = size + addr_mask - PAGE_SIZE + 1;
 		if (upsized_size < size) {
-			// integer aritmetic overflow
-			errno = EOVERFLOW;
+			// Integer aritmetic overflow.
 			return NULL;
 		}
 
@@ -515,8 +515,7 @@ span_compute_singular(const size_t size, const size_t alignment)
 
 	const size_t total_size = pow2_round_up(offset + size, PAGE_SIZE);
 	if (unlikely(total_size < size)) {
-		// integer aritmetic overflow
-		errno = EOVERFLOW;
+		// Integer aritmetic overflow.
 		return (struct singular_span_params) { 0, 0 };
 	}
 
@@ -979,7 +978,6 @@ alloc_slice(struct slice_cache *const cache, const uint32_t required_rank, const
 			span = (struct slice_alloc_span *) span_create_regular(cache);
 			if (span == NULL) {
 				// Out of memory.
-				errno = ENOMEM;
 				return NULL;
 			}
 
@@ -1332,6 +1330,20 @@ slice_cache_release(struct slice_cache *const cache)
 	}
 }
 
+static inline bool
+is_valid_alignment(size_t alignment)
+{
+	if (!is_pow2z(alignment))
+		return false;
+
+	// Too large alignment value would defeat the logic that
+	// finds the start of the span from a given pointer.
+	if (alignment > (SPAN_ALIGNMENT / 2))
+		return false;
+
+	return true;
+}
+
 /**********************************************************************
  * Slice cache management - public API.
  **********************************************************************/
@@ -1401,34 +1413,80 @@ slice_cache_collect(struct slice_cache *const cache)
 void *
 slice_cache_alloc(struct slice_cache *const cache, const size_t size)
 {
+	void *ptr;
+
 	const uint32_t rank = get_rank(size);
 	if (rank < CHUNK_RANKS) {
 		// Handle small amd medium sizes.
-		return alloc_chunk(cache, rank);
+		ptr = alloc_chunk(cache, rank);
 	} else if (rank < CACHE_RANKS) {
 		// Handle large sizes.
-		return alloc_slice(cache, rank, false);
+		ptr = alloc_slice(cache, rank, false);
 	} else {
 		// Handle super-large sizes.
 		struct span_header *hdr = span_create_singular(cache, size, ALIGNMENT);
-		if (unlikely(hdr == NULL))
+		if (unlikely(hdr == NULL)) {
+			errno = ENOMEM;
 			return NULL;
+		}
 
 		cache->singular_alloc_num++;
 		return span_singular_data(hdr);
 	}
+
+	if (unlikely(ptr == NULL))
+		errno = ENOMEM;
+	return ptr;
+}
+
+void *
+slice_cache_zalloc(struct slice_cache *const cache, const size_t size)
+{
+	void *ptr;
+
+	const uint32_t rank = get_rank(size);
+	if (rank < CHUNK_RANKS) {
+		// Handle small amd medium sizes.
+		ptr = alloc_chunk(cache, rank);
+	} else if (rank < CACHE_RANKS) {
+		// Handle large sizes.
+		ptr = alloc_slice(cache, rank, false);
+	} else {
+		// Handle super-large sizes.
+		struct span_header *hdr = span_create_singular(cache, size, ALIGNMENT);
+		if (unlikely(hdr == NULL)) {
+			errno = ENOMEM;
+			return NULL;
+		}
+
+		cache->singular_alloc_num++;
+		return span_singular_data(hdr);
+	}
+
+	if (unlikely(ptr == NULL)) {
+		errno = ENOMEM;
+		return NULL;
+	}
+
+	memset(ptr, 0, size);
+	return ptr;
+}
+
+void *
+slice_cache_calloc(struct slice_cache *const cache, const size_t num, const size_t size)
+{
+	size_t total;
+	if(__builtin_mul_overflow(num, size, &total)) {
+		errno = EOVERFLOW;
+		return NULL;
+	}
+	return slice_cache_zalloc(cache, total);
 }
 
 void *
 slice_cache_aligned_alloc(struct slice_cache *const cache, const size_t alignment, const size_t size)
 {
-	if (!is_pow2z(alignment)) {
-		errno = EINVAL;
-		return NULL;
-	}
-	if (alignment > SPAN_ALIGNMENT / 2) {
-		// Too large alignment value would defeat the logic that
-		// finds the start of the span from a given pointer.
+	if (!is_valid_alignment(alignment)) {
 		errno = EINVAL;
 		return NULL;
 	}
@@ -1465,8 +1523,10 @@ slice_cache_aligned_alloc(struct slice_cache *const cache, const size_t alignmen
 		// Handle super-large sizes.
 		struct span_header *hdr = span_create_singular(cache, size,
 							       max(alignment, ALIGNMENT));
-		if (unlikely(hdr == NULL))
+		if (unlikely(hdr == NULL)) {
+			errno = ENOMEM;
 			return NULL;
+		}
 
 		cache->singular_alloc_num++;
 		return span_singular_data(hdr);
@@ -1478,49 +1538,6 @@ slice_cache_aligned_alloc(struct slice_cache *const cache, const size_t alignmen
 	const size_t align_mask = alignment - 1;
 	void *const ptr = slice_cache_alloc(cache, size + align_mask);
 	return (void *) ((((uintptr_t) ptr) + align_mask) & ~align_mask);
-}
-
-void
-slice_cache_free(struct slice_cache *const cache, void *const ptr)
-{
-	struct span_header *const hdr = span_from_ptr(ptr);
-	ASSERT(cache == hdr->cache);
-
-	if (span_is_singular(hdr)) {
-		// Free super-large chunks.
-		atomic_fetch_add_explicit(&cache->singular_free_num, 1, memory_order_relaxed);
-		span_destroy(hdr);
-		return;
-	}
-
-	// Free chunks from regular spans.
-	struct slice_alloc_span *const span = (struct slice_alloc_span *) hdr;
-	free_chunk(cache, span, ptr);
-}
-
-void
-slice_cache_free_maybe_remotely(struct slice_cache *const local_cache, void *const ptr)
-{
-	struct span_header *const hdr = span_from_ptr(ptr);
-
-	if (span_is_singular(hdr)) {
-		// Free super-large chunks.
-		atomic_fetch_add_explicit(&hdr->cache->singular_free_num, 1, memory_order_relaxed);
-		span_destroy(hdr);
-		return;
-	}
-
-	// Free chunks from regular spans.
-	struct slice_alloc_span *const span = (struct slice_alloc_span *) hdr;
-	if (hdr->cache == local_cache) {
-		// Nice, this is a local free actually.
-		free_chunk(local_cache, span, ptr);
-	} else {
-		// Well, this is really a remote free.
-		struct mpsc_qlink *const link = ptr;
-		mpsc_qlink_prepare(link);
-		mpsc_queue_append(&span->remote_free_list, link);
-	}
 }
 
 void *
@@ -1563,6 +1580,55 @@ slice_cache_realloc(struct slice_cache *const cache, void *const ptr, const size
 	slice_cache_free(cache, ptr);
 
 	return new_ptr;
+}
+
+void
+slice_cache_free(struct slice_cache *const cache, void *const ptr)
+{
+	if (ptr == NULL)
+		return;
+
+	struct span_header *const hdr = span_from_ptr(ptr);
+	ASSERT(cache == hdr->cache);
+
+	if (span_is_singular(hdr)) {
+		// Free super-large chunks.
+		atomic_fetch_add_explicit(&cache->singular_free_num, 1, memory_order_relaxed);
+		span_destroy(hdr);
+		return;
+	}
+
+	// Free chunks from regular spans.
+	struct slice_alloc_span *const span = (struct slice_alloc_span *) hdr;
+	free_chunk(cache, span, ptr);
+}
+
+void
+slice_cache_free_maybe_remotely(struct slice_cache *const local_cache, void *const ptr)
+{
+	if (ptr == NULL)
+		return;
+
+	struct span_header *const hdr = span_from_ptr(ptr);
+
+	if (span_is_singular(hdr)) {
+		// Free super-large chunks.
+		atomic_fetch_add_explicit(&hdr->cache->singular_free_num, 1, memory_order_relaxed);
+		span_destroy(hdr);
+		return;
+	}
+
+	// Free chunks from regular spans.
+	struct slice_alloc_span *const span = (struct slice_alloc_span *) hdr;
+	if (hdr->cache == local_cache) {
+		// Nice, this is a local free actually.
+		free_chunk(local_cache, span, ptr);
+	} else {
+		// Well, this is really a remote free.
+		struct mpsc_qlink *const link = ptr;
+		mpsc_qlink_prepare(link);
+		mpsc_queue_append(&span->remote_free_list, link);
+	}
 }
 
 /**********************************************************************
@@ -1648,6 +1714,12 @@ release_local_cache(struct slice_cache *cache, void *data __attribute__((unused)
 }
 
 static void
+destroy_initial_cache(void)
+{
+	slice_cache_cleanup(&initial_cache, release_local_cache, NULL);
+}
+
+static void
 destroy_local_cache(void *ptr)
 {
 	slice_cache_cleanup((struct slice_cache *) ptr, release_local_cache, NULL);
@@ -1660,8 +1732,11 @@ prepare_local_cache(void)
 	slice_cache_prepare(&initial_cache);
 	local_cache = &initial_cache;
 
-	// Create the key needed for cleanup.
+	// Create the key needed for cleanup on thread exit.
 	pthread_key_create(&local_cache_key, destroy_local_cache);
+
+	// Register for cleanup on process exit.
+	atexit(destroy_initial_cache);
 }
 
 static struct slice_cache *
@@ -1681,10 +1756,10 @@ get_local_cache(void)
 				return NULL;
 			slice_cache_prepare(cache);
 			local_cache = cache;
-		}
 
-		// This is only for cleanup. We don't use pthread_getspecific().
-		pthread_setspecific(local_cache_key, cache);
+			// This is only for cleanup. We don't use pthread_getspecific().
+			pthread_setspecific(local_cache_key, cache);
+		}
 	}
 	return cache;
 }
@@ -1693,8 +1768,10 @@ void
 slice_local_collect(void)
 {
 	struct slice_cache *cache = get_local_cache();
-	if (unlikely(cache == NULL))
+	if (unlikely(cache == NULL)) {
+		errno = ENOMEM;
 		return;
+	}
 	slice_cache_collect(cache);
 }
 
@@ -1702,17 +1779,43 @@ void *
 slice_alloc(const size_t size)
 {
 	struct slice_cache *cache = get_local_cache();
-	if (unlikely(cache == NULL))
+	if (unlikely(cache == NULL)) {
+		errno = ENOMEM;
 		return NULL;
+	}
 	return slice_cache_alloc(cache, size);
+}
+
+void *
+slice_zalloc(const size_t size)
+{
+	struct slice_cache *cache = get_local_cache();
+	if (unlikely(cache == NULL)) {
+		errno = ENOMEM;
+		return NULL;
+	}
+	return slice_cache_zalloc(cache, size);
+}
+
+void *
+slice_calloc(const size_t num, const size_t size)
+{
+	struct slice_cache *cache = get_local_cache();
+	if (unlikely(cache == NULL)) {
+		errno = ENOMEM;
+		return NULL;
+	}
+	return slice_cache_calloc(cache, num, size);
 }
 
 void *
 slice_aligned_alloc(const size_t alignment, const size_t size)
 {
 	struct slice_cache *cache = get_local_cache();
-	if (unlikely(cache == NULL))
+	if (unlikely(cache == NULL)) {
+		errno = ENOMEM;
 		return NULL;
+	}
 	return slice_cache_aligned_alloc(cache, alignment, size);
 }
 
@@ -1720,8 +1823,10 @@ void *
 slice_realloc(void *const ptr, const size_t size)
 {
 	struct slice_cache *cache = get_local_cache();
-	if (unlikely(cache == NULL))
+	if (unlikely(cache == NULL)) {
+		errno = ENOMEM;
 		return NULL;
+	}
 	return slice_cache_realloc(cache, ptr, size);
 }
 
@@ -1729,4 +1834,50 @@ void
 slice_free(void *const ptr)
 {
 	slice_cache_free_maybe_remotely(local_cache, ptr);
+}
+
+/**********************************************************************
+ * Overrides of libc functions.
+ **********************************************************************/
+
+#define ALIAS(name) __attribute__((alias(#name), used, visibility("default")))
+
+void *malloc(size_t size) ALIAS(slice_alloc);
+void *calloc(size_t num, size_t size) ALIAS(slice_calloc);
+void *realloc(void *ptr, size_t size) ALIAS(slice_realloc);
+void *aligned_alloc(size_t alignment, size_t size) ALIAS(slice_aligned_alloc);
+void *memalign(size_t alignment, size_t size) ALIAS(slice_aligned_alloc);
+void free(void *ptr) ALIAS(slice_free);
+
+size_t malloc_usable_size(void *const ptr) ALIAS(slice_usable_size);
+
+int
+posix_memalign(void **pptr, size_t alignment, size_t size)
+{
+	if (pptr == NULL || !is_valid_alignment(alignment))
+		return EINVAL;
+
+	struct slice_cache *cache = get_local_cache();
+	if (unlikely(cache == NULL))
+		return ENOMEM;
+
+	void *ptr = slice_cache_aligned_alloc(cache, alignment, size);
+	if (ptr == NULL)
+		return ENOMEM;
+
+	*pptr = ptr;
+	return 0;
+}
+
+void *
+valloc(size_t size)
+{
+	return slice_aligned_alloc(PAGE_SIZE, size);
+}
+
+void *
+pvalloc(size_t size)
+{
+	size = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+	return slice_aligned_alloc(PAGE_SIZE, size);
 }

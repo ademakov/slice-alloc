@@ -87,16 +87,22 @@ void *
 slice_cache_alloc(struct slice_cache *cache, size_t size);
 
 void *
+slice_cache_zalloc(struct slice_cache *cache, size_t size);
+
+void *
+slice_cache_calloc(struct slice_cache *cache, size_t num, size_t size);
+
+void *
 slice_cache_aligned_alloc(struct slice_cache *cache, size_t alignment, size_t size);
+
+void *
+slice_cache_realloc(struct slice_cache *cache, void *ptr, size_t size);
 
 void
 slice_cache_free(struct slice_cache *cache, void *ptr);
 
 void
 slice_cache_free_maybe_remotely(struct slice_cache *local_cache, void *ptr);
-
-void *
-slice_cache_realloc(struct slice_cache *cache, void *ptr, size_t size);
 
 size_t
 slice_usable_size(const void *ptr);
@@ -111,13 +117,19 @@ void *
 slice_alloc(size_t size);
 
 void *
-slice_aligned_alloc(size_t alignment, size_t size);
+slice_zalloc(size_t size);
 
-void
-slice_free(void *ptr);
+void *
+slice_calloc(size_t num, size_t size);
+
+void *
+slice_aligned_alloc(size_t alignment, size_t size);
 
 void *
 slice_realloc(void *ptr, size_t size);
+
+void
+slice_free(void *ptr);
 
 #ifdef __cplusplus
 } // extern "C"
