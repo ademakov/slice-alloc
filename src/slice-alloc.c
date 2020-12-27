@@ -1125,28 +1125,28 @@ alloc_chunk(struct slice_cache *const cache, const uint32_t rank)
 			return inner_base + inner_shift * memory_sizes[rank];
 		}
 
-		// Allocate a medium chunk and use it as an inner block.
+		// Allocate am outer chunk and use it as an inner block.
 		uint8_t *inner_base;
 		block = cache->active->blocks[outer_rank];
 		if (block != NULL) {
-			// Use a cached block.
+			// Use a cached outer block.
 			ASSERT(block->chunk_free);
 			const uint32_t shift = ctz(block->chunk_free);
-			// Mark the medium chunk as an inner block.
+			// Mark a free outer chunk as an inner block.
 			block->inner_used |= (1u << shift);
 			block->inner_free |= (1u << shift);
 			block->chunk_free ^= (1u << shift);
 			if (block->chunk_free == 0) {
-				// Remove a fully used block.
+				// Remove a fully used outer block.
 				cache->active->blocks[outer_rank] = block->next;
 			}
 			inner_base = (uint8_t *) block + shift * memory_sizes[outer_rank];
 		} else {
-			// Allocate a new block.
+			// Allocate a new outer block.
 			block = alloc_outer(cache, outer_rank);
 			if (unlikely(block == NULL))
 				return NULL;
-			// Mark the medium chunk as an inner block.
+			// Mark the first outer chunk as an inner block.
 			block->inner_used |= 2;
 			block->inner_free |= 2;
 			inner_base = (uint8_t *) block + memory_sizes[outer_rank];
@@ -1552,7 +1552,7 @@ slice_cache_realloc(struct slice_cache *const cache, void *const ptr, const size
 	if (ptr == NULL) {
 		return slice_cache_alloc(cache, size);
 	} else if (size == 0) {
-		slice_cache_free(cache, ptr);
+		slice_cache_free_maybe_remotely(cache, ptr);
 		return NULL;
 	}
 
@@ -1583,7 +1583,7 @@ slice_cache_realloc(struct slice_cache *const cache, void *const ptr, const size
 		return NULL;
 
 	memcpy(new_ptr, ptr, min(old_size, size));
-	slice_cache_free(cache, ptr);
+	slice_cache_free_maybe_remotely(cache, ptr);
 
 	return new_ptr;
 }
