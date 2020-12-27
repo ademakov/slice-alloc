@@ -1707,12 +1707,15 @@ static pthread_once_t local_cache_once = PTHREAD_ONCE_INIT;
 
 // Initial cache used for bootstrapping.
 static struct slice_cache initial_cache;
+static spinlock_t initial_cache_lock = SPINLOCK_INIT;
 
 static void
 release_local_cache(struct slice_cache *cache, void *data __attribute__((unused)))
 {
 	if (cache != &initial_cache) {
+		spin_lock(&initial_cache_lock);
 		slice_cache_free(&initial_cache, cache);
+		spin_unlock(&initial_cache_lock);
 	} else {
 		pthread_key_delete(local_cache_key);
 	}
@@ -1750,22 +1753,20 @@ get_local_cache(void)
 {
 	struct slice_cache *cache = local_cache;
 	if (unlikely(cache == NULL)) {
-		// Initialize local cache global data if needed.
+		// Initialize global data needed for local caches if needed.
 		pthread_once(&local_cache_once, prepare_local_cache);
 
-		// Create a new cache unless the slice_cache_boot cache has
-		// just been initialized in this thread.
-		cache = local_cache;
-		if (likely(cache == NULL)) {
-			cache = slice_cache_alloc(&initial_cache, sizeof(struct slice_cache));
-			if (cache == NULL)
-				return NULL;
-			slice_cache_prepare(cache);
-			local_cache = cache;
+		// Create a new local cache.
+		spin_lock(&initial_cache_lock);
+		cache = slice_cache_alloc(&initial_cache, sizeof(struct slice_cache));
+		spin_unlock(&initial_cache_lock);
+		if (cache == NULL)
+			return NULL;
+		slice_cache_prepare(cache);
+		local_cache = cache;
 
-			// This is only for cleanup. We don't use pthread_getspecific().
-			pthread_setspecific(local_cache_key, cache);
-		}
+		// This is only for cleanup. We don't use pthread_getspecific().
+		pthread_setspecific(local_cache_key, cache);
 	}
 	return cache;
 }
