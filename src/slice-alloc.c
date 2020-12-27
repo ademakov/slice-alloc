@@ -1556,11 +1556,9 @@ slice_cache_realloc(struct slice_cache *const cache, void *const ptr, const size
 		return NULL;
 	}
 
-	struct span_header *const hdr = span_from_ptr(ptr);
-	ASSERT(cache == hdr->cache);
-
 	// Try to reuse the original chunk.
 	size_t old_size;
+	struct span_header *const hdr = span_from_ptr(ptr);
 	if (span_is_singular(hdr)) {
 		// Handle super-large chunks.
 		old_size = span_singular_size(hdr);
