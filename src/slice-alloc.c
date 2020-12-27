@@ -1047,7 +1047,6 @@ alloc_block(struct slice_cache *const cache, const uint32_t rank)
 		return NULL;
 
 	// Set it up as a block.
-	block->next = NULL;
 	block->inner_next = NULL;
 	block->inner_used = 0;
 	block->inner_free = 0;
@@ -1056,8 +1055,12 @@ alloc_block(struct slice_cache *const cache, const uint32_t rank)
 	// for allocation right away.
 	block->chunk_free = 0xfffc;
 
+	// TODO: allocating a slice may take a span from the staging list with
+	// existing blocks of the required size. Thus we allocated a slice for
+	// no reason. Fix this.
+
 	// Cache the block for futher use.
-	ASSERT(cache->active->blocks[rank - OUTER_TO_SLICE] == NULL);
+	block->next = cache->active->blocks[rank - OUTER_TO_SLICE];
 	cache->active->blocks[rank - OUTER_TO_SLICE] = block;
 
 	return block;
@@ -1152,10 +1155,13 @@ alloc_chunk(struct slice_cache *const cache, const uint32_t rank)
 		// Mark the remaining small chunks as free.
 		((struct inner_block *) inner_base)->free = 0xfffc;
 
+		// TODO: allocating a slice may take a span from the staging list with
+		// existing blocks of the required size. Thus we allocated a slice for
+		// no reason. Fix this.
+
 		// Cache the block for futher use.
-		ASSERT(cache->active->blocks[rank] == NULL);
+		block->inner_next = cache->active->blocks[rank];
 		cache->active->blocks[rank] = block;
-		block->inner_next = NULL;
 
 		cache->active->alloc_num++;
 		cache->regular_alloc_num++;
