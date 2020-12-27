@@ -1039,10 +1039,10 @@ alloc_slice(struct slice_cache *const cache, const uint32_t required_rank, const
 }
 
 static struct outer_block *
-alloc_block(struct slice_cache *const cache, const uint32_t rank)
+alloc_outer(struct slice_cache *const cache, const uint32_t rank)
 {
 	// Allocate a large chunk.
-	struct outer_block *const block = alloc_slice(cache, rank, true);
+	struct outer_block *const block = alloc_slice(cache, rank + OUTER_TO_SLICE, true);
 	if (unlikely(block == NULL))
 		return NULL;
 
@@ -1060,8 +1060,8 @@ alloc_block(struct slice_cache *const cache, const uint32_t rank)
 	// no reason. Fix this.
 
 	// Cache the block for futher use.
-	block->next = cache->active->blocks[rank - OUTER_TO_SLICE];
-	cache->active->blocks[rank - OUTER_TO_SLICE] = block;
+	block->next = cache->active->blocks[rank];
+	cache->active->blocks[rank] = block;
 
 	return block;
 }
@@ -1089,7 +1089,7 @@ alloc_chunk(struct slice_cache *const cache, const uint32_t rank)
 		}
 
 		// Allocate a new block.
-		block = alloc_block(cache, rank + OUTER_TO_SLICE);
+		block = alloc_outer(cache, rank);
 		if (unlikely(block == NULL))
 			return NULL;
 
@@ -1143,7 +1143,7 @@ alloc_chunk(struct slice_cache *const cache, const uint32_t rank)
 			inner_base = (uint8_t *) block + shift * memory_sizes[outer_rank];
 		} else {
 			// Allocate a new block.
-			block = alloc_block(cache, outer_rank + OUTER_TO_SLICE);
+			block = alloc_outer(cache, outer_rank);
 			if (unlikely(block == NULL))
 				return NULL;
 			// Mark the medium chunk as an inner block.
