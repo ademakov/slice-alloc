@@ -962,7 +962,7 @@ alloc_slice(struct slice_cache *const cache, const uint32_t required_rank, const
 		// Try to find a suitable span in the staging list.
 		struct slice_cache_node *node = list_head(&cache->staging);
 		while (node != list_stub(&cache->staging)) {
-			struct slice_alloc_span *next = containerof(link, struct slice_alloc_span, staging_node);
+			struct slice_alloc_span *next = containerof(node, struct slice_alloc_span, staging_node);
 			original_rank = find_slice(next, required_rank);
 			if (original_rank < CACHE_RANKS) {
 				next->status = SPAN_ACTIVE;
