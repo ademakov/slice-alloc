@@ -96,6 +96,12 @@ void *
 slice_cache_aligned_alloc(struct slice_cache *cache, size_t alignment, size_t size);
 
 void *
+slice_cache_aligned_zalloc(struct slice_cache *cache, size_t alignment, size_t size);
+
+void *
+slice_cache_aligned_calloc(struct slice_cache *cache, size_t alignment, size_t num, size_t size);
+
+void *
 slice_cache_realloc(struct slice_cache *cache, void *ptr, size_t size);
 
 void
@@ -124,6 +130,12 @@ slice_calloc(size_t num, size_t size);
 
 void *
 slice_aligned_alloc(size_t alignment, size_t size);
+
+void *
+slice_aligned_zalloc(size_t alignment, size_t size);
+
+void *
+slice_aligned_calloc(size_t alignment, size_t num, size_t size);
 
 void *
 slice_realloc(void *ptr, size_t size);

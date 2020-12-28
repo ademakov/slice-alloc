@@ -1337,7 +1337,7 @@ slice_cache_release(struct slice_cache *const cache)
 }
 
 static inline bool
-is_valid_alignment(size_t alignment)
+is_valid_alignment(const size_t alignment)
 {
 	if (!is_pow2z(alignment))
 		return false;
@@ -1348,6 +1348,24 @@ is_valid_alignment(size_t alignment)
 		return false;
 
 	return true;
+}
+
+static size_t
+chunk_alignment(const uint32_t rank)
+{
+	if (rank < CHUNK_RANKS) {
+		switch ((rank & 3)) {
+		case 0:
+			return memory_sizes[rank];
+		case 1:
+			return memory_sizes[rank - 1] / 4;
+		case 2:
+			return memory_sizes[rank - 2] / 2;
+		case 3:
+			return memory_sizes[rank - 3] / 4;
+		}
+	}
+	return UNIT_SIZE;
 }
 
 /**********************************************************************
@@ -1419,15 +1437,15 @@ slice_cache_collect(struct slice_cache *const cache)
 void *
 slice_cache_alloc(struct slice_cache *const cache, const size_t size)
 {
-	void *ptr;
-
 	const uint32_t rank = get_rank(size);
-	if (rank < CHUNK_RANKS) {
-		// Handle small amd medium sizes.
-		ptr = alloc_chunk(cache, rank);
-	} else if (rank < CACHE_RANKS) {
-		// Handle large sizes.
-		ptr = alloc_slice(cache, rank, false);
+	if (rank < CACHE_RANKS) {
+		// Handle small, medium, and large sizes.
+		void *ptr = (rank < CHUNK_RANKS ?
+			     alloc_chunk(cache, rank) :
+			     alloc_slice(cache, rank, false));
+		if (unlikely(ptr == NULL))
+			errno = ENOMEM;
+		return ptr;
 	} else {
 		// Handle super-large sizes.
 		struct span_header *hdr = span_create_singular(cache, size, ALIGNMENT);
@@ -1435,28 +1453,25 @@ slice_cache_alloc(struct slice_cache *const cache, const size_t size)
 			errno = ENOMEM;
 			return NULL;
 		}
-
 		cache->singular_alloc_num++;
 		return span_singular_data(hdr);
 	}
-
-	if (unlikely(ptr == NULL))
-		errno = ENOMEM;
-	return ptr;
 }
 
 void *
 slice_cache_zalloc(struct slice_cache *const cache, const size_t size)
 {
-	void *ptr;
-
 	const uint32_t rank = get_rank(size);
-	if (rank < CHUNK_RANKS) {
-		// Handle small amd medium sizes.
-		ptr = alloc_chunk(cache, rank);
-	} else if (rank < CACHE_RANKS) {
-		// Handle large sizes.
-		ptr = alloc_slice(cache, rank, false);
+	if (rank < CACHE_RANKS) {
+		// Handle small, medium, and large sizes.
+		void *ptr = (rank < CHUNK_RANKS ?
+			     alloc_chunk(cache, rank) :
+			     alloc_slice(cache, rank, false));
+		if (unlikely(ptr == NULL))
+			errno = ENOMEM;
+		else
+			memset(ptr, 0, size);
+		return ptr;
 	} else {
 		// Handle super-large sizes.
 		struct span_header *hdr = span_create_singular(cache, size, ALIGNMENT);
@@ -1464,18 +1479,9 @@ slice_cache_zalloc(struct slice_cache *const cache, const size_t size)
 			errno = ENOMEM;
 			return NULL;
 		}
-
 		cache->singular_alloc_num++;
 		return span_singular_data(hdr);
 	}
-
-	if (unlikely(ptr == NULL)) {
-		errno = ENOMEM;
-		return NULL;
-	}
-
-	memset(ptr, 0, size);
-	return ptr;
 }
 
 void *
@@ -1499,31 +1505,15 @@ slice_cache_aligned_alloc(struct slice_cache *const cache, const size_t alignmen
 
 	// Try to use natural alignment of chunks.
 	const uint32_t rank = get_rank(size);
-	if (rank < CHUNK_RANKS) {
-		// Handle small amd medium sizes.
-		size_t alloc_align;
-		switch ((rank & 3)) {
-		case 0:
-			alloc_align = memory_sizes[rank];
-			break;
-		case 1:
-			alloc_align = memory_sizes[rank - 1] / 4;
-			break;
-		case 2:
-			alloc_align = memory_sizes[rank - 2] / 2;
-			break;
-		case 3:
-			alloc_align = memory_sizes[rank - 3] / 4;
-			break;
-		}
-		if (alignment <= alloc_align) {
-			return alloc_chunk(cache, rank);
-		}
-	} else if (rank < CACHE_RANKS) {
-		// Handle large sizes.
-		if (alignment <= UNIT_SIZE) {
-			// All slices are UNIT_SIZE-aligned.
-			return alloc_slice(cache, rank, false);
+	if (rank < CACHE_RANKS) {
+		// Handle small, medium, and large sizes.
+		if (alignment <= chunk_alignment(rank)) {
+			void *ptr = (rank < CHUNK_RANKS ?
+				     alloc_chunk(cache, rank) :
+				     alloc_slice(cache, rank, false));
+			if (unlikely(ptr == NULL))
+				errno = ENOMEM;
+			return ptr;
 		}
 	} else {
 		// Handle super-large sizes.
@@ -1533,7 +1523,6 @@ slice_cache_aligned_alloc(struct slice_cache *const cache, const size_t alignmen
 			errno = ENOMEM;
 			return NULL;
 		}
-
 		cache->singular_alloc_num++;
 		return span_singular_data(hdr);
 	}
@@ -1543,7 +1532,64 @@ slice_cache_aligned_alloc(struct slice_cache *const cache, const size_t alignmen
 	// to be able to free them with pointers shifted by alignment.
 	const size_t align_mask = alignment - 1;
 	void *const ptr = slice_cache_alloc(cache, size + align_mask);
+	if (ptr == NULL)
+		return ptr;
 	return (void *) ((((uintptr_t) ptr) + align_mask) & ~align_mask);
+}
+
+void *
+slice_cache_aligned_zalloc(struct slice_cache *const cache, const size_t alignment, const size_t size)
+{
+	if (!is_valid_alignment(alignment)) {
+		errno = EINVAL;
+		return NULL;
+	}
+
+	// Try to use natural alignment of chunks.
+	const uint32_t rank = get_rank(size);
+	if (rank < CACHE_RANKS) {
+		// Handle small, medium, and large sizes.
+		if (alignment <= chunk_alignment(rank)) {
+			void *ptr = (rank < CHUNK_RANKS ?
+				     alloc_chunk(cache, rank) :
+				     alloc_slice(cache, rank, false));
+			if (unlikely(ptr == NULL))
+				errno = ENOMEM;
+			else
+				memset(ptr, 0, size);
+			return ptr;
+		}
+	} else {
+		// Handle super-large sizes.
+		struct span_header *hdr = span_create_singular(cache, size,
+							       max(alignment, ALIGNMENT));
+		if (unlikely(hdr == NULL)) {
+			errno = ENOMEM;
+			return NULL;
+		}
+		cache->singular_alloc_num++;
+		return span_singular_data(hdr);
+	}
+
+	// Fall back to allocating a larger chunk and aligning within it.
+	// TODO: extend the unit map for large slices with large alignment
+	// to be able to free them with pointers shifted by alignment.
+	const size_t align_mask = alignment - 1;
+	void *const ptr = slice_cache_zalloc(cache, size + align_mask);
+	if (ptr == NULL)
+		return ptr;
+	return (void *) ((((uintptr_t) ptr) + align_mask) & ~align_mask);
+}
+
+void *
+slice_cache_aligned_calloc(struct slice_cache *const cache, const size_t alignment, const size_t num, const size_t size)
+{
+	size_t total;
+	if(__builtin_mul_overflow(num, size, &total)) {
+		errno = EOVERFLOW;
+		return NULL;
+	}
+	return slice_cache_aligned_zalloc(cache, alignment, total);
 }
 
 void *
@@ -1822,6 +1868,28 @@ slice_aligned_alloc(const size_t alignment, const size_t size)
 		return NULL;
 	}
 	return slice_cache_aligned_alloc(cache, alignment, size);
+}
+
+void *
+slice_aligned_zalloc(const size_t alignment, const size_t size)
+{
+	struct slice_cache *cache = get_local_cache();
+	if (unlikely(cache == NULL)) {
+		errno = ENOMEM;
+		return NULL;
+	}
+	return slice_cache_aligned_zalloc(cache, alignment, size);
+}
+
+void *
+slice_aligned_calloc(const size_t alignment, const size_t num, const size_t size)
+{
+	struct slice_cache *cache = get_local_cache();
+	if (unlikely(cache == NULL)) {
+		errno = ENOMEM;
+		return NULL;
+	}
+	return slice_cache_aligned_calloc(cache, alignment, num, size);
 }
 
 void *
