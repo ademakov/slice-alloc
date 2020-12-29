@@ -1470,7 +1470,7 @@ slice_cache_zalloc(struct slice_cache *const cache, const size_t size)
 		if (unlikely(ptr == NULL))
 			errno = ENOMEM;
 		else
-			memset(ptr, 0, size);
+			memset(ptr, 0, memory_sizes[rank]);
 		return ptr;
 	} else {
 		// Handle super-large sizes.
@@ -1556,7 +1556,7 @@ slice_cache_aligned_zalloc(struct slice_cache *const cache, const size_t alignme
 			if (unlikely(ptr == NULL))
 				errno = ENOMEM;
 			else
-				memset(ptr, 0, size);
+				memset(ptr, 0, memory_sizes[rank]);
 			return ptr;
 		}
 	} else {
