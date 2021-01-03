@@ -29,6 +29,9 @@
 extern "C" {
 #endif
 
+// CPU cache-line size.
+#define SLICE_CACHE_ALIGN		__attribute__((__aligned__(64)))
+
 struct slice_cache;
 
 struct slice_cache_node
@@ -40,6 +43,18 @@ struct slice_cache_node
 struct slice_cache_list
 {
 	struct slice_cache_node node;
+};
+
+struct slice_cache_mpsc_node
+{
+	 struct slice_cache_mpsc_node *_Atomic next;
+};
+
+struct slice_cache_mpsc_queue
+{
+	SLICE_CACHE_ALIGN struct slice_cache_mpsc_node *_Atomic tail;
+	SLICE_CACHE_ALIGN struct slice_cache_mpsc_node *head;
+	struct slice_cache_mpsc_node stub;
 };
 
 /*
@@ -72,6 +87,9 @@ struct slice_cache
 	uint64_t regular_free_num;
 	uint64_t singular_alloc_num;
 	uint64_t _Atomic singular_free_num;
+
+	/* The list of chunks freed remotely. */
+	struct slice_cache_mpsc_queue remote_free_list;
 };
 
 void

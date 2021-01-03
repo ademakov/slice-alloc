@@ -33,22 +33,23 @@
 
 #include <sys/mman.h>
 
+#define TRACE 0
+
+#if TRACE
+#include <stdio.h>
+#endif
+
 /**********************************************************************
  * Common macros.
  **********************************************************************/
 
 // Minimum alignment.
 #define ALIGNMENT		(16)
-// CPU cache-line size.
-#define CACHELINE		(64)
 // Virtual memory page size.
 #define PAGE_SIZE		(4096)
 
 #define likely(x)		__builtin_expect(!!(x), 1)
 #define unlikely(x)		__builtin_expect(!!(x), 0)
-
-#define ALIGN(x)		__attribute__((__aligned__(x)))
-#define CACHE_ALIGN		ALIGN(CACHELINE)
 
 #define min(a, b) ({			\
 		typeof(a) _a = (a);	\
@@ -153,7 +154,7 @@ panic(const char *msg)
 
 #define SPINLOCK_INIT { ATOMIC_VAR_INIT(false) }
 
-typedef struct CACHE_ALIGN
+typedef SLICE_CACHE_ALIGN struct
 {
 	atomic_bool lock;
 } spinlock_t;
@@ -206,26 +207,14 @@ spin_unlock(spinlock_t *lock)
  * The only thing is that here the 'tail' and 'head' have reverse meanining.
  */
 
-struct mpsc_qlink
-{
-	 struct mpsc_qlink *_Atomic next;
-};
-
-struct mpsc_queue
-{
-	CACHE_ALIGN struct mpsc_qlink *_Atomic tail;
-	CACHE_ALIGN struct mpsc_qlink *head;
-	struct mpsc_qlink stub;
-};
-
 static inline void
-mpsc_qlink_prepare(struct mpsc_qlink *link)
+mpsc_qlink_prepare(struct slice_cache_mpsc_node *link)
 {
 	atomic_init(&link->next, NULL);
 }
 
 static inline void
-mpsc_queue_prepare(struct mpsc_queue *list)
+mpsc_queue_prepare(struct slice_cache_mpsc_queue *list)
 {
 	list->head = &list->stub;
 	atomic_init(&list->tail, &list->stub);
@@ -233,23 +222,26 @@ mpsc_queue_prepare(struct mpsc_queue *list)
 }
 
 static inline void
-mpsc_queue_append_span(struct mpsc_queue *list, struct mpsc_qlink *head, struct mpsc_qlink *tail)
+mpsc_queue_append_span(struct slice_cache_mpsc_queue *list,
+		       struct slice_cache_mpsc_node *head,
+		       struct slice_cache_mpsc_node *tail)
 {
-	struct mpsc_qlink *prev = atomic_exchange(&list->tail, tail);
+	struct slice_cache_mpsc_node *prev = atomic_exchange(&list->tail, tail);
 	atomic_store_explicit(&prev->next, head, memory_order_release);
 }
 
 static inline void
-mpsc_queue_append(struct mpsc_queue *list, struct mpsc_qlink *link)
+mpsc_queue_append(struct slice_cache_mpsc_queue *list,
+		  struct slice_cache_mpsc_node *link)
 {
 	mpsc_queue_append_span(list, link, link);
 }
 
-static struct mpsc_qlink *
-mpsc_queue_remove(struct mpsc_queue *list)
+static struct slice_cache_mpsc_node *
+mpsc_queue_remove(struct slice_cache_mpsc_queue *list)
 {
-	struct mpsc_qlink *head = list->head;
-	struct mpsc_qlink *next = atomic_load_explicit(&head->next, memory_order_acquire);
+	struct slice_cache_mpsc_node *head = list->head;
+	struct slice_cache_mpsc_node *next = atomic_load_explicit(&head->next, memory_order_acquire);
 	if (head == &list->stub) {
 		if (next == NULL)
 			return NULL;
@@ -261,7 +253,7 @@ mpsc_queue_remove(struct mpsc_queue *list)
 		return head;
 	}
 
-	struct mpsc_qlink *tail = atomic_load_explicit(&list->tail, memory_order_acquire);
+	struct slice_cache_mpsc_node *tail = atomic_load_explicit(&list->tail, memory_order_acquire);
 	if (tail != head)
 		return NULL;
 
@@ -474,6 +466,10 @@ span_alloc_space(const size_t size, const size_t addr_mask)
 			return NULL;
 		}
 
+#if TRACE
+		void *addr0 = addr;
+#endif
+
 		void *upsized_addr = mmap(NULL, upsized_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 		if (upsized_addr == MAP_FAILED)
 			return NULL;
@@ -485,6 +481,12 @@ span_alloc_space(const size_t size, const size_t addr_mask)
 			span_free_space(upsized_addr, leading_size);
 		if (trailing_size)
 			span_free_space(addr + size, trailing_size);
+
+#if TRACE
+		printf("mmap %zx (%p) %zx %p %p %zx %zx\n", size, addr0, upsized_size, upsized_addr, addr, leading_size, trailing_size);
+	} else {
+		printf("mmap %zx %p\n", size, addr);
+#endif
 	}
 
 	return addr;
@@ -647,9 +649,6 @@ struct slice_alloc_span
 	/* Statistics. */
 	uint64_t alloc_num;
 	uint64_t free_num;
-
-	// The list of chunks freed remotely.
-	struct mpsc_queue remote_free_list;
 
 	// Cached chunk blocks and slices.
 	struct outer_block *blocks[CHUNK_RANKS];
@@ -938,13 +937,108 @@ prepare_span(struct slice_alloc_span *const span)
 	memset(span->units, 0, sizeof span->units);
 #endif
 
-	// Initialize the remote free list.
-	mpsc_queue_prepare(&span->remote_free_list);
-
 	// The initial heap layout takes out the very first 4KiB slice
 	// from the span. It is used up for the very span header that is
 	// initialized here.
 	split_slice(span, 0, CACHE_RANKS, CHUNK_RANKS);
+}
+
+static void
+free_chunk(struct slice_cache *const cache, struct slice_alloc_span *const span, void *const ptr)
+{
+	span->free_num++;
+	cache->regular_free_num++;
+
+	// Identify the chunk.
+	const uint32_t base = deduce_base(span, ptr);
+	VERIFY(base >= 4 && base < UNIT_NUMBER, "bad pointer");
+	const uint8_t rank = span->units[base];
+	const uint8_t mark = span->units[base + 1];
+	VERIFY(rank >= CHUNK_RANKS && rank < CACHE_RANKS, "bad pointer");
+
+	// Free a whole slice.
+	if ((mark & ~UNIT_LMASK) != BASE_TAG) {
+		VERIFY((mark & ~UNIT_LMASK) != NEXT_TAG, "double free");
+		VERIFY(mark == 0, "bad pointer");
+		free_slice(span, base, rank);
+		return;
+	}
+
+	// Locate the outer block.
+	const uint32_t outer_rank = rank - OUTER_TO_SLICE;
+	struct outer_block *const block = (struct outer_block *) ((uint8_t *) span + base * UNIT_SIZE);
+	const uint32_t shift = (((uint8_t *) ptr - (uint8_t *) block) * memory_magic[outer_rank]) >> MAGIC_SHIFT;
+	VERIFY(shift > 0 || shift < 32, "bad pointer");
+
+	// Free a chunk from the outer block.
+	const uint32_t mask = 1u << shift;
+	if ((block->inner_used & mask) == 0) {
+		VERIFY((block->chunk_free & mask) == 0, "double free");
+		if (block->chunk_free == 0) {
+			block->next = span->blocks[outer_rank];
+			span->blocks[outer_rank] = block;
+		}
+		block->chunk_free |= mask;
+		return;
+	}
+
+	// Locate the inner block.
+	const uint32_t inner_rank = outer_rank - INNER_TO_OUTER;
+	struct inner_block *const inner = (struct inner_block *) ((uint8_t *) block + shift * memory_sizes[outer_rank]);
+	const uint32_t inner_shift = (((uint8_t *) ptr - (uint8_t *) inner) * memory_magic[inner_rank]) >> MAGIC_SHIFT;
+	VERIFY(inner_shift > 0 || inner_shift < 32, "bad pointer");
+
+	// Free a chunk from the inner block.
+	const uint32_t inner_mask = 1u << inner_shift;
+	VERIFY((inner->free & inner_mask) == 0, "double free");
+	inner->free |= inner_mask;
+	if (inner->free != 0xfffe) {
+		if (block->inner_free == 0) {
+			block->inner_next = span->blocks[inner_rank];
+			span->blocks[inner_rank] = block;
+		}
+		block->inner_free |= mask;
+	} else {
+		if (block->chunk_free == 0) {
+			block->next = span->blocks[outer_rank];
+			span->blocks[outer_rank] = block;
+		}
+		block->chunk_free |= mask;
+
+		block->inner_used ^= mask;
+		block->inner_free ^= mask;
+		if (block->inner_free == 0) {
+			struct outer_block *prev = span->blocks[inner_rank];
+			if (prev == block) {
+				span->blocks[inner_rank] = block->inner_next;
+			} else {
+				while (prev) {
+					if (prev->inner_next == block) {
+						prev->inner_next = block->inner_next;
+						break;
+					}
+					prev = prev->inner_next;
+				}
+			}
+		}
+	}
+}
+
+static void
+release_remote(struct slice_cache *const cache)
+{
+	for (;;) {
+		void *ptr = mpsc_queue_remove(&cache->remote_free_list);
+		if (ptr == NULL)
+			break;
+
+		struct span_header *const hdr = span_from_ptr(ptr);
+		ASSERT(span_is_regular(hdr));
+		ASSERT(cache == hdr->cache);
+
+		struct slice_alloc_span *const span = (struct slice_alloc_span *) hdr;
+		free_chunk(cache, span, ptr);
+	}
 }
 
 static void *
@@ -955,8 +1049,15 @@ alloc_slice(struct slice_cache *const cache, const uint32_t required_rank, const
 	struct slice_alloc_span *span = cache->active;
 	uint32_t original_rank = find_slice(span, required_rank);
 	if (original_rank >= CACHE_RANKS) {
-		// TODO: Try to coalesce freed memory in the active span.
+		// Check for remotely freed chunks.
+		release_remote(cache);
 
+		original_rank = find_slice(span, required_rank);
+
+		// TODO: Try to coalesce freed memory in the active span.
+	}
+
+	if (original_rank >= CACHE_RANKS) {
 		span = NULL;
 
 		// Try to find a suitable span in the staging list.
@@ -1169,87 +1270,6 @@ alloc_chunk(struct slice_cache *const cache, const uint32_t rank)
 	}
 }
 
-static void
-free_chunk(struct slice_cache *const cache, struct slice_alloc_span *const span, void *const ptr)
-{
-	span->free_num++;
-	cache->regular_free_num++;
-
-	// Identify the chunk.
-	const uint32_t base = deduce_base(span, ptr);
-	VERIFY(base >= 4 && base < UNIT_NUMBER, "bad pointer");
-	const uint8_t rank = span->units[base];
-	const uint8_t mark = span->units[base + 1];
-	VERIFY(rank >= CHUNK_RANKS && rank < CACHE_RANKS, "bad pointer");
-
-	// Free a whole slice.
-	if ((mark & ~UNIT_LMASK) != BASE_TAG) {
-		VERIFY((mark & ~UNIT_LMASK) != NEXT_TAG, "double free");
-		VERIFY(mark == 0, "bad pointer");
-		free_slice(span, base, rank);
-		return;
-	}
-
-	// Locate the outer block.
-	const uint32_t outer_rank = rank - OUTER_TO_SLICE;
-	struct outer_block *const block = (struct outer_block *) ((uint8_t *) span + base * UNIT_SIZE);
-	const uint32_t shift = (((uint8_t *) ptr - (uint8_t *) block) * memory_magic[outer_rank]) >> MAGIC_SHIFT;
-	VERIFY(shift > 0 || shift < 32, "bad pointer");
-
-	// Free a chunk from the outer block.
-	const uint32_t mask = 1u << shift;
-	if ((block->inner_used & mask) == 0) {
-		VERIFY((block->chunk_free & mask) == 0, "double free");
-		if (block->chunk_free == 0) {
-			block->next = span->blocks[outer_rank];
-			span->blocks[outer_rank] = block;
-		}
-		block->chunk_free |= mask;
-		return;
-	}
-
-	// Locate the inner block.
-	const uint32_t inner_rank = outer_rank - INNER_TO_OUTER;
-	struct inner_block *const inner = (struct inner_block *) ((uint8_t *) block + shift * memory_sizes[outer_rank]);
-	const uint32_t inner_shift = (((uint8_t *) ptr - (uint8_t *) inner) * memory_magic[inner_rank]) >> MAGIC_SHIFT;
-	VERIFY(inner_shift > 0 || inner_shift < 32, "bad pointer");
-
-	// Free a chunk from the inner block.
-	const uint32_t inner_mask = 1u << inner_shift;
-	VERIFY((inner->free & inner_mask) == 0, "double free");
-	inner->free |= inner_mask;
-	if (inner->free != 0xfffe) {
-		if (block->inner_free == 0) {
-			block->inner_next = span->blocks[inner_rank];
-			span->blocks[inner_rank] = block;
-		}
-		block->inner_free |= mask;
-	} else {
-		if (block->chunk_free == 0) {
-			block->next = span->blocks[outer_rank];
-			span->blocks[outer_rank] = block;
-		}
-		block->chunk_free |= mask;
-
-		block->inner_used ^= mask;
-		block->inner_free ^= mask;
-		if (block->inner_free == 0) {
-			struct outer_block *prev = span->blocks[inner_rank];
-			if (prev == block) {
-				span->blocks[inner_rank] = block->inner_next;
-			} else {
-				while (prev) {
-					if (prev->inner_next == block) {
-						prev->inner_next = block->inner_next;
-						break;
-					}
-					prev = prev->inner_next;
-				}
-			}
-		}
-	}
-}
-
 static uint32_t
 get_chunk_rank(const struct span_header *const hdr, const void *const ptr)
 {
@@ -1291,17 +1311,6 @@ get_chunk_size(const struct span_header *const hdr, const void *const ptr)
  * Slice cache management.
  **********************************************************************/
 
-static void
-handle_remote_free_list(struct slice_cache *const cache, struct slice_alloc_span *const span)
-{
-	for (;;) {
-		struct mpsc_qlink *link = mpsc_queue_remove(&span->remote_free_list);
-		if (link == NULL)
-			break;
-		free_chunk(cache, span, link);
-	}
-}
-
 static bool
 slice_cache_all_free(const struct slice_cache *const cache)
 {
@@ -1319,7 +1328,6 @@ slice_cache_collect_staging(struct slice_cache *const cache)
 	while (node != list_stub(&cache->staging)) {
 		struct slice_alloc_span *span = containerof(node, struct slice_alloc_span, staging_node);
 		struct slice_cache_node *next = node->next;
-		handle_remote_free_list(cache, span);
 		if (span->alloc_num == span->free_num) {
 			list_delete(node);
 			span_destroy(&span->header);
@@ -1387,6 +1395,9 @@ slice_cache_prepare(struct slice_cache *const cache)
 {
 	list_prepare(&cache->staging);
 
+	// Initialize the remote free list.
+	mpsc_queue_prepare(&cache->remote_free_list);
+
 	cache->active = (struct slice_alloc_span *) span_create_regular(cache);
 	VERIFY(cache->active, "failed to create an initial memory span");
 	prepare_span(cache->active);
@@ -1427,8 +1438,8 @@ slice_cache_cleanup(struct slice_cache *const cache, slice_cache_release_t cb, v
 void
 slice_cache_collect(struct slice_cache *const cache)
 {
-	// Try to free some slices in the active span.
-	handle_remote_free_list(cache, cache->active);
+	// Check for remotely freed chunks.
+	release_remote(cache);
 
 	// Try to free some spans in the staging list.
 	slice_cache_collect_staging(cache);
@@ -1675,9 +1686,9 @@ slice_cache_free_maybe_remotely(struct slice_cache *const local_cache, void *con
 		free_chunk(local_cache, span, ptr);
 	} else {
 		// Well, this is really a remote free.
-		struct mpsc_qlink *const link = ptr;
+		struct slice_cache_mpsc_node *const link = ptr;
 		mpsc_qlink_prepare(link);
-		mpsc_queue_append(&span->remote_free_list, link);
+		mpsc_queue_append(&hdr->cache->remote_free_list, link);
 	}
 }
 
