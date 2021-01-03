@@ -953,7 +953,7 @@ prepare_span(struct slice_alloc_span *const span)
 }
 
 static void
-free_chunk(struct slice_cache *const cache, struct slice_alloc_span *const span, void *const ptr)
+free_chunk(struct slice_alloc_span *const span, void *const ptr)
 {
 	span->free_num++;
 
@@ -1044,8 +1044,7 @@ release_remote(struct slice_cache *const cache)
 		ASSERT(span_is_regular(hdr));
 		ASSERT(cache == hdr->cache);
 
-		struct slice_alloc_span *const span = (struct slice_alloc_span *) hdr;
-		free_chunk(cache, span, ptr);
+		free_chunk((struct slice_alloc_span *) hdr, ptr);
 	}
 }
 
@@ -1668,8 +1667,7 @@ slice_cache_free(struct slice_cache *const cache, void *const ptr)
 	}
 
 	// Free chunks from regular spans.
-	struct slice_alloc_span *const span = (struct slice_alloc_span *) hdr;
-	free_chunk(cache, span, ptr);
+	free_chunk((struct slice_alloc_span *) hdr, ptr);
 }
 
 void
@@ -1688,10 +1686,9 @@ slice_cache_free_maybe_remotely(struct slice_cache *const local_cache, void *con
 	}
 
 	// Free chunks from regular spans.
-	struct slice_alloc_span *const span = (struct slice_alloc_span *) hdr;
 	if (hdr->cache == local_cache) {
 		// Nice, this is a local free actually.
-		free_chunk(local_cache, span, ptr);
+		free_chunk((struct slice_alloc_span *) hdr, ptr);
 	} else {
 		// Well, this is really a remote free.
 		struct slice_cache_mpsc_node *const link = ptr;
