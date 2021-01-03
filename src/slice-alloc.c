@@ -560,6 +560,37 @@ span_destroy(struct span_header *const hdr)
  * Regular memory spans.
  **********************************************************************/
 
+/*
+  Chunk Ranks
+  ===========
+
+  row | msb | 0            | 1            | 2            | 3            |
+ -----+-----+--------------+--------------+--------------+--------------+--------------
+   0  |  3  |       8 (0)  |      10 (1)  |      12 (2)  |      14 (3)  | SMALL SIZES
+   1  |  4  |      16 (4)  |      20 (5)  |      24 (6)  |      28 (7)  |
+   2  |  5  |      32 (8)  |      40 (9)  |      48 (10) }      56 (11) |
+ -----+-----+--------------+--------------+--------------+-----------------------------
+   3  |  6  |      64 (12) |      80 (13) |      96 (14) |     112 (15) | MEDIUM SIZES
+   4  |  7  |     128 (16) |     160 (17) |     192 (18) |     224 (19) |
+   5  |  8  |     256 (20) |     320 (21) |     384 (22) |     448 (23) |
+   6  |  9  |     512 (24) |     640 (25) |     768 (26) |     896 (27) |
+   7  | 10  |    1024 (28) |    1280 (29) |    1536 (30) |    1792 (31) |
+   8  | 11  |    2048 (32) |    2560 (33) |    3072 (34) |    3584 (35) |
+ -----+-----+--------------+--------------+--------------+--------------+--------------
+   9  | 12  |    4096 (36) |    5120 (37) |    6144 (38) |    7168 (39) | LARGE SIZES
+  10  | 13  |    8192 (40) |   10240 (41) |   12288 (42) |   14336 (43) |
+  11  | 14  |   16384 (44) |   20480 (45) |   24576 (46) |   28672 (47) |
+  12  | 15  |   32768 (48) |   40960 (49) |   49152 (50) |   57344 (51) |
+  13  | 16  |   65536 (52) |   81920 (53) |   98304 (54) |  114688 (55) |
+  14  | 17  |  131072 (56) |  163840 (57) |  196608 (58) |  229376 (59) |
+  15  | 18  |  262144 (60) |  327680 (61) |  393216 (62) |  458752 (63) |
+  16  | 19  |  524288 (64) |  655360 (65) |  786432 (66) |  917504 (67) |
+  17  | 20  | 1048576 (68) | 1310720 (69) | 1572864 (70) | 1835008 (71) |
+ -----+-----+--------------+--------------+--------------+--------------+--------------
+  18  | 21  | 2097152 (72)  ...                                         | HUGE SIZES
+
+*/
+
 typedef enum
 {
 	SPAN_ACTIVE = 0,
@@ -567,8 +598,8 @@ typedef enum
 } span_status_t;
 
 // The number of chunk ranks. 
-#define INNER_CHUNK_RANKS	(16u)
-#define OUTER_CHUNK_RANKS	(20u)
+#define INNER_CHUNK_RANKS	(12u)
+#define OUTER_CHUNK_RANKS	(24u)
 #define CHUNK_RANKS		(INNER_CHUNK_RANKS + OUTER_CHUNK_RANKS)
 #define SLICE_RANKS		(36u)
 #define CACHE_RANKS		(CHUNK_RANKS + SLICE_RANKS)
@@ -579,7 +610,7 @@ typedef enum
 // The rank distance between an inner chunk and its parent outer chunk.
 #define INNER_TO_OUTER		(20u)
 // The rank distance between an outer chunk and its parent slice.
-#define OUTER_TO_SLICE		(20u)
+#define OUTER_TO_SLICE		(24u)
 
 // Sizes of the memory map units in a regular span.
 #define HEAD_SIZE		(4096u)
@@ -639,12 +670,12 @@ struct outer_block
 
         // A bitset of free chunks. The very first chunk is never free as
 	// it is used for the header itself.
-	uint32_t chunk_free;
+	uint64_t chunk_free;
 
         // A bitset of chunks used for small chunks.
-	uint32_t inner_used;
+	uint64_t inner_used;
 	// A bitset of chunks with some free small chunks.
-	uint32_t inner_free;
+	uint64_t inner_free;
 };
 
 // Regular span header.
@@ -976,10 +1007,10 @@ free_chunk(struct slice_alloc_span *const span, void *const ptr)
 	const uint32_t outer_rank = rank - OUTER_TO_SLICE;
 	struct outer_block *const block = (struct outer_block *) ((uint8_t *) span + base * UNIT_SIZE);
 	const uint32_t shift = (((uint8_t *) ptr - (uint8_t *) block) * memory_magic[outer_rank]) >> MAGIC_SHIFT;
-	VERIFY(shift > 0 || shift < 32, "bad pointer");
+	VERIFY(shift > 0 || shift < 64, "bad pointer");
 
 	// Free a chunk from the outer block.
-	const uint32_t mask = 1u << shift;
+	const uint64_t mask = 1ull << shift;
 	if ((block->inner_used & mask) == 0) {
 		VERIFY((block->chunk_free & mask) == 0, "double free");
 		if (block->chunk_free == 0) {
@@ -1158,9 +1189,9 @@ alloc_outer(struct slice_cache *const cache, const uint32_t rank)
 	block->inner_used = 0;
 	block->inner_free = 0;
 
-	// One slot is used for 'struct mm_memory_block', another will be used
-	// for allocation right away.
-	block->chunk_free = 0xfffc;
+	// One slot is used for 'struct outer_block', another will be used for
+	// allocation right away.
+	block->chunk_free = 0xfffffffc;
 
 	// TODO: allocating a slice may take a span from the staging list with
 	// existing blocks of the required size. Thus we allocated a slice for
@@ -1184,7 +1215,7 @@ alloc_chunk(struct slice_cache *const cache, const uint32_t rank)
 		if (block != NULL) {
 			ASSERT(block->chunk_free);
 			const uint32_t shift = ctz(block->chunk_free);
-			block->chunk_free ^= (1u << shift);
+			block->chunk_free ^= (1ull << shift);
 			if (block->chunk_free == 0) {
 				// Remove a fully used block.
 				cache->active->blocks[rank] = block->next;
@@ -1218,7 +1249,7 @@ alloc_chunk(struct slice_cache *const cache, const uint32_t rank)
 			const uint32_t inner_shift = ctz(inner->free);
 			inner->free ^= (1u << inner_shift);
 			if (inner->free == 0) {
-				block->inner_free ^= (1u << shift);
+				block->inner_free ^= (1ull << shift);
 				if (block->inner_free == 0) {
 					// Remove a fully used inner block.
 					cache->active->blocks[rank] = block->inner_next;
@@ -1237,9 +1268,9 @@ alloc_chunk(struct slice_cache *const cache, const uint32_t rank)
 			ASSERT(block->chunk_free);
 			const uint32_t shift = ctz(block->chunk_free);
 			// Mark a free outer chunk as an inner block.
-			block->inner_used |= (1u << shift);
-			block->inner_free |= (1u << shift);
-			block->chunk_free ^= (1u << shift);
+			block->inner_used |= (1ull << shift);
+			block->inner_free |= (1ull << shift);
+			block->chunk_free ^= (1ull << shift);
 			if (block->chunk_free == 0) {
 				// Remove a fully used outer block.
 				cache->active->blocks[outer_rank] = block->next;
@@ -1251,8 +1282,8 @@ alloc_chunk(struct slice_cache *const cache, const uint32_t rank)
 			if (unlikely(block == NULL))
 				return NULL;
 			// Mark the first outer chunk as an inner block.
-			block->inner_used |= 2;
-			block->inner_free |= 2;
+			block->inner_used |= 2ull;
+			block->inner_free |= 2ull;
 			inner_base = (uint8_t *) block + memory_sizes[outer_rank];
 		}
 
@@ -1294,7 +1325,7 @@ get_chunk_rank(const struct span_header *const hdr, const void *const ptr)
 	VERIFY(shift > 0 || shift < 32, "bad pointer");
 
 	// Handle a chunk from the outer block.
-	const uint32_t mask = 1u << shift;
+	const uint64_t mask = 1ull << shift;
 	if ((block->inner_used & mask) == 0)
 		return outer_rank;
 
