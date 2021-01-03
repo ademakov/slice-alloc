@@ -956,7 +956,6 @@ static void
 free_chunk(struct slice_cache *const cache, struct slice_alloc_span *const span, void *const ptr)
 {
 	span->free_num++;
-	cache->regular_free_num++;
 
 	// Identify the chunk.
 	const uint32_t base = deduce_base(span, ptr);
@@ -1116,7 +1115,6 @@ alloc_slice(struct slice_cache *const cache, const uint32_t required_rank, const
 		span->units[base + 2] = 0;
 
 		span->alloc_num++;
-		cache->regular_alloc_num++;
 	} else {
 		// The slice is to be used as a block. Fill the unit map.
 		const uint8_t bytes[4] = {
@@ -1194,7 +1192,6 @@ alloc_chunk(struct slice_cache *const cache, const uint32_t rank)
 			}
 
 			cache->active->alloc_num++;
-			cache->regular_alloc_num++;
 			return (uint8_t *) block + shift * memory_sizes[rank];
 		}
 
@@ -1204,7 +1201,6 @@ alloc_chunk(struct slice_cache *const cache, const uint32_t rank)
 			return NULL;
 
 		cache->active->alloc_num++;
-		cache->regular_alloc_num++;
 		return (uint8_t *) block + memory_sizes[rank];
 
 	} else {
@@ -1231,7 +1227,6 @@ alloc_chunk(struct slice_cache *const cache, const uint32_t rank)
 			}
 
 			cache->active->alloc_num++;
-			cache->regular_alloc_num++;
 			return inner_base + inner_shift * memory_sizes[rank];
 		}
 
@@ -1274,7 +1269,6 @@ alloc_chunk(struct slice_cache *const cache, const uint32_t rank)
 		cache->active->blocks[rank] = block;
 
 		cache->active->alloc_num++;
-		cache->regular_alloc_num++;
 		return inner_base + memory_sizes[rank];
 	}
 }
@@ -1321,12 +1315,19 @@ get_chunk_size(const struct span_header *const hdr, const void *const ptr)
  **********************************************************************/
 
 static bool
-slice_cache_all_free(const struct slice_cache *const cache)
+slice_cache_all_free(struct slice_cache *const cache)
 {
-	if (cache->regular_alloc_num != cache->regular_free_num)
-		return false;
+	struct slice_cache_node *node = list_head(&cache->staging);
+	while (node != list_stub(&cache->staging)) {
+		struct slice_alloc_span *span = containerof(node, struct slice_alloc_span, staging_node);
+		if (span->alloc_num != span->free_num)
+			return false;
+		node = node->next;
+	}
+
 	if (cache->singular_alloc_num != atomic_load_explicit(&cache->singular_free_num, memory_order_relaxed))
 		return false;
+
 	return true;
 }
 
@@ -1411,8 +1412,6 @@ slice_cache_prepare(struct slice_cache *const cache)
 	VERIFY(cache->active, "failed to create an initial memory span");
 	prepare_span(cache->active);
 
-	cache->regular_alloc_num = 0;
-	cache->regular_free_num = 0;
 	cache->singular_alloc_num = 0;
 	cache->singular_free_num = 0;
 }

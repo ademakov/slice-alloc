@@ -83,8 +83,6 @@ struct slice_cache
 	void *release_callback_data;
 
 	/* Statistics. */
-	uint64_t regular_alloc_num;
-	uint64_t regular_free_num;
 	uint64_t singular_alloc_num;
 	uint64_t _Atomic singular_free_num;
 
