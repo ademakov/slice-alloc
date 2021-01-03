@@ -34,6 +34,7 @@
 #include <sys/mman.h>
 
 #define TRACE 0
+#define CHECK_LEVEL 0
 
 #if TRACE
 #include <stdio.h>
@@ -75,8 +76,16 @@
  * Abnormal termination.
  **********************************************************************/
 
-#define ASSERT(e)	(likely(e) ? (void) 0 : panic("panic: " LOCATION ": assertion failed\n"))
-#define VERIFY(e, msg)	(likely(e) ? (void) 0 : panic("panic: " LOCATION ": " msg "\n"))
+#if CHECK_LEVEL > 1
+# define ASSERT(e)	(likely(e) ? (void) 0 : panic("panic: " LOCATION ": assertion failed\n"))
+#else
+# define ASSERT(e)	((void) (e))
+#endif
+#if CHECK_LEVEL > 0
+# define VERIFY(e, msg)	(likely(e) ? (void) 0 : panic("panic: " LOCATION ": " msg "\n"))
+#else
+# define VERIFY(e, msg)	((void) (e))
+#endif
 
 static void noreturn
 panic(const char *msg)
