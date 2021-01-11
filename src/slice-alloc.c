@@ -566,28 +566,61 @@ span_destroy(struct span_header *const hdr)
 
   row | msb | 0            | 1            | 2            | 3            |
  -----+-----+--------------+--------------+--------------+--------------+--------------
-   0  |  3  |       8 (0)  |      10 (1)  |      12 (2)  |      14 (3)  | SMALL SIZES
-   1  |  4  |      16 (4)  |      20 (5)  |      24 (6)  |      28 (7)  |
-   2  |  5  |      32 (8)  |      40 (9)  |      48 (10) }      56 (11) |
+   0  |  -  |       8 (0)  |      16 (1)  |      32 (2)  |      48 (3)  | SMALL SIZES
  -----+-----+--------------+--------------+--------------+-----------------------------
-   3  |  6  |      64 (12) |      80 (13) |      96 (14) |     112 (15) | MEDIUM SIZES
-   4  |  7  |     128 (16) |     160 (17) |     192 (18) |     224 (19) |
-   5  |  8  |     256 (20) |     320 (21) |     384 (22) |     448 (23) |
-   6  |  9  |     512 (24) |     640 (25) |     768 (26) |     896 (27) |
-   7  | 10  |    1024 (28) |    1280 (29) |    1536 (30) |    1792 (31) |
-   8  | 11  |    2048 (32) |    2560 (33) |    3072 (34) |    3584 (35) |
+   1  |  6  |      64 (4)  |      80 (5)  |      96 (6)  |     112 (7)  | MEDIUM SIZES
+   2  |  7  |     128 (8)  |     160 (9)  |     192 (10) |     224 (11) |
+   3  |  8  |     256 (12) |     320 (13) |     384 (14) |     448 (15) |
+   4  |  9  |     512 (16) |     640 (17) |     768 (18) |     896 (19) |
+   5  | 10  |    1024 (20) |    1280 (21) |    1536 (22) |    1792 (23) |
+   6  | 11  |    2048 (24) |    2560 (25) |    3072 (26) |    3584 (27) |
  -----+-----+--------------+--------------+--------------+--------------+--------------
-   9  | 12  |    4096 (36) |    5120 (37) |    6144 (38) |    7168 (39) | LARGE SIZES
-  10  | 13  |    8192 (40) |   10240 (41) |   12288 (42) |   14336 (43) |
-  11  | 14  |   16384 (44) |   20480 (45) |   24576 (46) |   28672 (47) |
-  12  | 15  |   32768 (48) |   40960 (49) |   49152 (50) |   57344 (51) |
-  13  | 16  |   65536 (52) |   81920 (53) |   98304 (54) |  114688 (55) |
-  14  | 17  |  131072 (56) |  163840 (57) |  196608 (58) |  229376 (59) |
-  15  | 18  |  262144 (60) |  327680 (61) |  393216 (62) |  458752 (63) |
-  16  | 19  |  524288 (64) |  655360 (65) |  786432 (66) |  917504 (67) |
-  17  | 20  | 1048576 (68) | 1310720 (69) | 1572864 (70) | 1835008 (71) |
+   7  | 12  |    4096 (28) |    5120 (29) |    6144 (30) |    7168 (31) | LARGE SIZES
+   8  | 13  |    8192 (32) |   10240 (23) |   12288 (34) |   14336 (35) |
+   9  | 14  |   16384 (36) |   20480 (37) |   24576 (38) |   28672 (39) |
+  10  | 15  |   32768 (40) |   40960 (41) |   49152 (42) |   57344 (43) |
+  11  | 16  |   65536 (44) |   81920 (45) |   98304 (46) |  114688 (47) |
+  12  | 17  |  131072 (48) |  163840 (49) |  196608 (50) |  229376 (51) |
+  13  | 18  |  262144 (52) |  327680 (53) |  393216 (54) |  458752 (55) |
+  14  | 19  |  524288 (56) |  655360 (57) |  786432 (58) |  917504 (59) |
+  15  | 20  | 1048576 (60) | 1310720 (61) | 1572864 (62) | 1835008 (63) |
  -----+-----+--------------+--------------+--------------+--------------+--------------
-  18  | 21  | 2097152 (72)  ...                                         | HUGE SIZES
+  16  | 21  | 2097152 (64)  ...                                         | SUPER SIZES
+
+
+  Unit Map Encoding
+  =================
+
+  byte 0
+  ------
+  chunk rank:
+    value >= 0x00 --   0 -- 0 0 0 0 | 0 0 0 0
+    value <= 0x3f --  63 -- 0 0 1 1 | 1 1 1 1
+    0 0 x x | x x x x
+
+  byte 1
+  ------
+  for a used slice -- base of itself, lo 6 bits
+    value >= 0x40 --  64 -- 0 1  0 0 | 0 0 0 0
+    value <= 0x7f -- 127 -- 0 1  1 1 | 1 1 1 1
+    0 1 x x | x x x x
+  [ for blocks also repeated at bytes 3, 5, ... ]
+
+  for a free slice
+    value == 0xfe -- 254
+    1 1 1 1 | 1 1 1 0
+
+  byte 2
+  ------
+  for a used slice -- base of itself, hi 5 bits
+    value >= 0x80 -- 128 -- 1 0 0 0 | 0 0 0 0
+    value <= 0x9f -- 159 -- 1 0 0 1 | 1 1 1 1
+    1 0 x x | x x x x
+  [ for blocks also repeated at bytes 4, 6, ... ]
+
+  for a free slice
+    value == 0xff -- 255
+    1 1 1 1 | 1 1 1 1
 
 */
 
@@ -598,19 +631,14 @@ typedef enum
 } span_status_t;
 
 // The number of chunk ranks. 
-#define INNER_CHUNK_RANKS	(12u)
-#define OUTER_CHUNK_RANKS	(24u)
-#define CHUNK_RANKS		(INNER_CHUNK_RANKS + OUTER_CHUNK_RANKS)
+#define SMALL_RANKS		(4u)
+#define MEDIUM_RANKS		(24u)
 #define SLICE_RANKS		(36u)
-#define CACHE_RANKS		(CHUNK_RANKS + SLICE_RANKS)
+#define BLOCK_RANKS		(SMALL_RANKS + MEDIUM_RANKS)
+#define CACHE_RANKS		(BLOCK_RANKS + SLICE_RANKS)
 
 // The number of ranks that are allocated by halving.
 #define BUDDY_RANKS		(SLICE_RANKS - 12u)
-
-// The rank distance between an inner chunk and its parent outer chunk.
-#define INNER_TO_OUTER		(20u)
-// The rank distance between an outer chunk and its parent slice.
-#define OUTER_TO_SLICE		(24u)
 
 // Sizes of the memory map units in a regular span.
 #define HEAD_SIZE		(4096u)
@@ -623,59 +651,41 @@ typedef enum
 #define UNIT_LMASK		((1u << UNIT_LBITS) - 1u)
 #define UNIT_HMASK		((1u << UNIT_HBITS) - 1u)
 
-#define BASE_TAG		(128u)
-#define NEXT_TAG		(192u)
+#define BASE_LMIN		CACHE_RANKS
+#define BASE_LMAX		(BASE_LMIN + UNIT_LMASK)
+#define BASE_HMIN		(BASE_LMAX + 1)
+#define BASE_HMAX		(BASE_HMIN + UNIT_HMASK)
 
-#define MAKE_SIZE(r, m)		((size_t) (4u | (m)) << (r + 1u))
+#define FREE_TAG1		(254u)
+#define FREE_TAG2		(255u)
 
-#define MAGIC_SHIFT		(18u)
-#define MAGIC_FACTOR		(1u << MAGIC_SHIFT)
-#define MAKE_MAGIC(r, m)	((MAGIC_FACTOR + MAKE_SIZE(r, m) - 1u) / MAKE_SIZE(r, m))
+#define FIRST_ROW(_)		_(3u, 0u), _(4u, 0u), _(5u, 0u), _(5u, 2u)
+#define OTHER_ROW(r, _)		_(r, 0u), _(r, 1u), _(r, 2u), _(r, 3u)
+#define BLOCK_ROWS(_)		\
+	OTHER_ROW(6u, _),	\
+	OTHER_ROW(7u, _),	\
+	OTHER_ROW(8u, _),	\
+	OTHER_ROW(9u, _),	\
+	OTHER_ROW(10u, _),	\
+	OTHER_ROW(11u, _)
+#define SLICE_ROWS(_)		\
+	OTHER_ROW(12u, _),	\
+	OTHER_ROW(13u, _),	\
+	OTHER_ROW(14u, _),	\
+	OTHER_ROW(15u, _),	\
+	OTHER_ROW(16u, _),	\
+	OTHER_ROW(17u, _),	\
+	OTHER_ROW(18u, _),	\
+	OTHER_ROW(19u, _),	\
+	OTHER_ROW(20u, _)
 
-#define RANKS_ROW(r, _)		_(r, 0u), _(r, 1u), _(r, 2u), _(r, 3u)
-#define LOWER_RANKS(_)		\
-	RANKS_ROW(0u, _),	\
-	RANKS_ROW(1u, _),	\
-	RANKS_ROW(2u, _),	\
-	RANKS_ROW(3u, _),	\
-	RANKS_ROW(4u, _),	\
-	RANKS_ROW(5u, _),	\
-	RANKS_ROW(6u, _),	\
-	RANKS_ROW(7u, _),	\
-	RANKS_ROW(8u, _)
-#define UPPER_RANKS(_)		\
-	RANKS_ROW(9u, _),	\
-	RANKS_ROW(10u, _),	\
-	RANKS_ROW(11u, _),	\
-	RANKS_ROW(12u, _),	\
-	RANKS_ROW(13u, _),	\
-	RANKS_ROW(14u, _),	\
-	RANKS_ROW(15u, _),	\
-	RANKS_ROW(16u, _),	\
-	RANKS_ROW(17u, _)
-
-// The header struct for a block of small chunks.
-struct inner_block
+// Header for a block of small or medium chunks.
+struct block
 {
-        // A bitset of free chunks. The very first chunk is never free as
-	// it is used for the header itself.
-	uint32_t free;
-};
-
-// The header struct for a block of medium chunks.
-struct outer_block
-{
-	struct outer_block *next;
-	struct outer_block *inner_next;
-
-        // A bitset of free chunks. The very first chunk is never free as
-	// it is used for the header itself.
-	uint64_t chunk_free;
-
-        // A bitset of chunks used for small chunks.
-	uint64_t inner_used;
-	// A bitset of chunks with some free small chunks.
-	uint64_t inner_free;
+	void *free_list;
+	uint32_t free_num;
+	uint32_t free_max;
+	struct slice_cache_node node;
 };
 
 // Regular span header.
@@ -686,27 +696,44 @@ struct slice_alloc_span
 	struct slice_cache_node staging_node;
 	span_status_t status;
 
-	/* Statistics. */
-	uint64_t alloc_num;
-	uint64_t free_num;
+	uint32_t slice_num;
+	uint32_t block_num;
 
-	// Cached chunk blocks and slices.
-	struct outer_block *blocks[CHUNK_RANKS];
-	uint16_t slices[SLICE_RANKS];
+	// Cached blocks and slices.
+	struct slice_cache_list blocks[BLOCK_RANKS];
+	void *slices[SLICE_RANKS];
 
 	// The map of units.
 	uint8_t units[UNIT_NUMBER];
 };
 
+#define RANK_SIZE(r, m)		((4u | (m)) << ((r) - 2u))
+#define SMALL_SLICE(r, m)	(((r) + 4u) * 4u + (m))
+#define MEDIUM_SLICE(r, m)	(((r) + 1u) * 4u + (m))
+#define SMALL_BLOCK_SIZE(r, m)	(512u)
+#define MEDIUM_BLOCK_SIZE(r, m)	(64u)
+#define BLOCK_USED(r, m)	((RANK_SIZE(r, m) + sizeof(struct block) - 1) / RANK_SIZE(r, m))
+
 // Memory rank sizes.
 static const uint32_t memory_sizes[] = {
-	LOWER_RANKS(MAKE_SIZE),
-	UPPER_RANKS(MAKE_SIZE)
+	FIRST_ROW(RANK_SIZE),
+	BLOCK_ROWS(RANK_SIZE),
+	SLICE_ROWS(RANK_SIZE),
 };
 
-// Chunk size magic numbers.
-static const uint32_t memory_magic[] = {
-	LOWER_RANKS(MAKE_MAGIC)
+static const uint32_t block_slice[] = {
+	FIRST_ROW(SMALL_SLICE),
+	BLOCK_ROWS(MEDIUM_SLICE),
+};
+
+static const uint32_t block_size[] = {
+	FIRST_ROW(SMALL_BLOCK_SIZE),
+	BLOCK_ROWS(MEDIUM_BLOCK_SIZE),
+};
+
+static const uint32_t block_used[] = {
+	FIRST_ROW(BLOCK_USED),
+	BLOCK_ROWS(BLOCK_USED),
 };
 
 static inline uint32_t
@@ -714,19 +741,21 @@ get_rank(size_t size)
 {
 	if (size-- <= 8)
 		return 0;
+	if (size < 128)
+		return (size + 16) >> 4;
 
 	// Search for most significant set bit, on x86 this should translate
 	// to a single BSR instruction.
 	const uint32_t msb = clz(size) ^ (nbits(size) - 1);
 
 	// Calcualte the rank.
-	return (msb << 2u) + (size >> (msb - 2u)) - 15u;
+	return (msb << 2u) + (size >> (msb - 2u)) - 23u;
 }
 
 static inline uint32_t
 decode_base(uint8_t hi, uint8_t lo)
 {
-	return ((uint32_t) hi << UNIT_LBITS) | (lo & UNIT_LMASK);
+	return (((uint32_t) hi - BASE_HMIN) << UNIT_LBITS) + (uint32_t) lo - BASE_LMIN;
 }
 
 static uint32_t
@@ -736,43 +765,43 @@ deduce_base(const struct slice_alloc_span *const span, const void *const ptr)
 	const uint32_t unit = offset / UNIT_SIZE;
 
 	const uint8_t x = span->units[unit];
-	if (x <= UNIT_HMASK) {
+	if (x >= BASE_LMIN) {
 		const uint8_t y = span->units[unit - 1];
-		VERIFY(y >= BASE_TAG, "bad pointer");
-		return decode_base(x, y);
-	}
-	if (x >= BASE_TAG) {
-		const uint8_t y = span->units[unit - 1];
-		if (y <= UNIT_HMASK)
+		if (x >= BASE_HMIN)
+			return decode_base(x, y);
+		if (y >= BASE_HMIN)
 			return decode_base(y, x);
 		return unit - 1;
 	}
-
 	return unit;
 }
 
 static void
 free_slice(struct slice_alloc_span *const span, const uint32_t base, const uint32_t rank)
 {
-	ASSERT(rank >= CHUNK_RANKS);
-	const uint32_t next = span->slices[rank - CHUNK_RANKS];
-	span->units[base + 1] = next | NEXT_TAG;
-	span->units[base + 2] = next >> UNIT_LBITS;
-	span->slices[rank - CHUNK_RANKS] = base;
+	ASSERT(rank >= BLOCK_RANKS);
+
+	void *const ptr = (uint8_t *) span + base * UNIT_SIZE;
+	const uint32_t index = rank - BLOCK_RANKS;
+	*((void **) ptr) = span->slices[index];
+	span->slices[index] = ptr;
+
+	span->units[base + 1] = FREE_TAG1;
+	span->units[base + 2] = FREE_TAG2;
 }
 
 static uint32_t
 find_slice(const struct slice_alloc_span *const span, uint32_t rank)
 {
-	ASSERT(rank >= CHUNK_RANKS && rank < CACHE_RANKS);
+	ASSERT(rank >= BLOCK_RANKS && rank < CACHE_RANKS);
 
-	while (rank < (CHUNK_RANKS + BUDDY_RANKS)) {
-		if (span->slices[rank - CHUNK_RANKS])
+	while (rank < (BLOCK_RANKS + BUDDY_RANKS)) {
+		if (span->slices[rank - BLOCK_RANKS])
 			return rank;
 		rank += 4;
 	}
 	while (rank < CACHE_RANKS) {
-		if (span->slices[rank - CHUNK_RANKS])
+		if (span->slices[rank - BLOCK_RANKS])
 			return rank;
 		rank += 1;
 	}
@@ -795,24 +824,18 @@ cut_two(struct slice_alloc_span *const span, const uint32_t base, const uint32_t
 }
 
 static void
-split_slice(struct slice_alloc_span *const span, const uint32_t original_base, const uint32_t original_rank, const uint32_t required_rank)
+split_slice(struct slice_alloc_span *const span, uint32_t base, uint32_t rank, const uint32_t original_rank)
 {
 	// Here the rank value is adjusted to large-only sizes.
-	ASSERT(original_rank > CHUNK_RANKS && original_rank <= CACHE_RANKS);
-	ASSERT(required_rank >= CHUNK_RANKS && required_rank < CACHE_RANKS);
-	ASSERT(original_rank > required_rank);
-
-	uint32_t base = original_base;
-	uint32_t rank = required_rank;
-
-	// Set the required slice on top of the original slice.
-	span->units[base] = rank;
-	base += memory_sizes[rank] / UNIT_SIZE;
+	ASSERT(original_rank > BLOCK_RANKS && original_rank <= CACHE_RANKS);
+	ASSERT(rank >= BLOCK_RANKS && rank < CACHE_RANKS);
+	ASSERT(rank < original_rank);
 
 	// Cut off the extra space from it slice-by-slice with doubling
 	// slice sizes:
 	//
 	//    +-------------------- <original slice>
+	//    |
 	//    V
 	//   [..............................]
 	//
@@ -822,7 +845,8 @@ split_slice(struct slice_alloc_span *const span, const uint32_t original_base, c
 	//    V   V
 	//   [..][..][......][..............]
 	//
-	while (rank < (CHUNK_RANKS + BUDDY_RANKS)) {
+	base += memory_sizes[rank] / UNIT_SIZE;
+	while (rank < (BLOCK_RANKS + BUDDY_RANKS)) {
 		cut_one(span, base, rank);
 		base += memory_sizes[rank] / UNIT_SIZE;
 
@@ -966,100 +990,76 @@ prepare_span(struct slice_alloc_span *const span)
 	// to zero it out manually.
 #if 0
 	span->status = SPAN_ACTIVE;
-	span->alloc_num = 0;
-	span->free_num = 0;
+	span->block_num = 0;
+	span->slice_num = 0;
 
-	for (uint32_t i = 0; i < CHUNK_RANKS; i++)
-		span->blocks[i] = NULL;
 	for (uint32_t i = 0; i < SLICE_RANKS; i++)
 		span->slices[i] = 0;
 
 	memset(span->units, 0, sizeof span->units);
 #endif
 
+	for (uint32_t i = 0; i < BLOCK_RANKS; i++)
+		list_prepare(&span->blocks[i]);
+
 	// The initial heap layout takes out the very first 4KiB slice
 	// from the span. It is used up for the very span header that is
 	// initialized here.
-	split_slice(span, 0, CACHE_RANKS, CHUNK_RANKS);
+	split_slice(span, 0, BLOCK_RANKS, CACHE_RANKS);
+	span->units[0] = BLOCK_RANKS;
 }
 
 static void
+coalesce_chunks(struct slice_alloc_span *const span)
+{
+	// Convert empty blocks to slices.
+	for (uint32_t rank = 0; rank < BLOCK_RANKS; rank++) {
+		struct slice_cache_node *node = list_head(&span->blocks[rank]);
+		while (node != list_stub(&span->blocks[rank])) {
+			struct block *block = containerof(node, struct block, node);
+			struct slice_cache_node *next = node->next;
+			if (block->free_num == block->free_max) {
+				const uint32_t offset = (uint8_t *) block - (uint8_t *) span;
+				span->units[offset / UNIT_SIZE] = block_slice[rank];
+				list_delete(&block->node);
+				span->block_num--;
+			}
+			node = next;
+		}
+	}
+
+	// TODO: coalesce free slices
+}
+
+static inline void
 free_chunk(struct slice_alloc_span *const span, void *const ptr)
 {
-	span->free_num++;
-
 	// Identify the chunk.
 	const uint32_t base = deduce_base(span, ptr);
 	VERIFY(base >= 4 && base < UNIT_NUMBER, "bad pointer");
 	const uint8_t rank = span->units[base];
-	const uint8_t mark = span->units[base + 1];
-	VERIFY(rank >= CHUNK_RANKS && rank < CACHE_RANKS, "bad pointer");
+	VERIFY(rank < CACHE_RANKS, "bad pointer");
+	VERIFY(span->units[base + 1] != FREE_TAG1, "double free");
+	VERIFY(span->units[base + 1] >= BASE_LMIN, "bad pointer");
+	VERIFY(span->units[base + 1] <= BASE_LMAX, "bad pointer");
 
-	// Free a whole slice.
-	if ((mark & ~UNIT_LMASK) != BASE_TAG) {
-		VERIFY((mark & ~UNIT_LMASK) != NEXT_TAG, "double free");
-		VERIFY(mark == 0, "bad pointer");
+	if (rank >= BLOCK_RANKS) {
+		// Free a whole slice.
+		span->slice_num--;
 		free_slice(span, base, rank);
-		return;
-	}
-
-	// Locate the outer block.
-	const uint32_t outer_rank = rank - OUTER_TO_SLICE;
-	struct outer_block *const block = (struct outer_block *) ((uint8_t *) span + base * UNIT_SIZE);
-	const uint32_t shift = (((uint8_t *) ptr - (uint8_t *) block) * memory_magic[outer_rank]) >> MAGIC_SHIFT;
-	VERIFY(shift > 0 || shift < 64, "bad pointer");
-
-	// Free a chunk from the outer block.
-	const uint64_t mask = 1ull << shift;
-	if ((block->inner_used & mask) == 0) {
-		VERIFY((block->chunk_free & mask) == 0, "double free");
-		if (block->chunk_free == 0) {
-			block->next = span->blocks[outer_rank];
-			span->blocks[outer_rank] = block;
-		}
-		block->chunk_free |= mask;
-		return;
-	}
-
-	// Locate the inner block.
-	const uint32_t inner_rank = outer_rank - INNER_TO_OUTER;
-	struct inner_block *const inner = (struct inner_block *) ((uint8_t *) block + shift * memory_sizes[outer_rank]);
-	const uint32_t inner_shift = (((uint8_t *) ptr - (uint8_t *) inner) * memory_magic[inner_rank]) >> MAGIC_SHIFT;
-	VERIFY(inner_shift > 0 || inner_shift < 32, "bad pointer");
-
-	// Free a chunk from the inner block.
-	const uint32_t inner_mask = 1u << inner_shift;
-	VERIFY((inner->free & inner_mask) == 0, "double free");
-	inner->free |= inner_mask;
-	if (inner->free != 0xfffe) {
-		if (block->inner_free == 0) {
-			block->inner_next = span->blocks[inner_rank];
-			span->blocks[inner_rank] = block;
-		}
-		block->inner_free |= mask;
 	} else {
-		if (block->chunk_free == 0) {
-			block->next = span->blocks[outer_rank];
-			span->blocks[outer_rank] = block;
-		}
-		block->chunk_free |= mask;
+		// Free a chunk from a block.
+		VERIFY(span->block_num > 0, "bad pointer");
+		struct block *const block = (struct block *) ((uint8_t *) span + base * UNIT_SIZE);
+		VERIFY(block->free_num < block->free_max, "double free");
 
-		block->inner_used ^= mask;
-		block->inner_free ^= mask;
-		if (block->inner_free == 0) {
-			struct outer_block *prev = span->blocks[inner_rank];
-			if (prev == block) {
-				span->blocks[inner_rank] = block->inner_next;
-			} else {
-				while (prev) {
-					if (prev->inner_next == block) {
-						prev->inner_next = block->inner_next;
-						break;
-					}
-					prev = prev->inner_next;
-				}
-			}
-		}
+		// If the block was empty it becomes usable again.
+		if (block->free_num++ == 0)
+			list_insert_first(&span->blocks[rank], &block->node);
+
+		// Add the chunk to the free list.
+		*((void **) ptr) = block->free_list;
+		block->free_list = ptr;
 	}
 }
 
@@ -1080,19 +1080,17 @@ release_remote(struct slice_cache *const cache)
 }
 
 static void *
-alloc_slice(struct slice_cache *const cache, const uint32_t required_rank, const bool block)
+alloc_slice(struct slice_cache *const cache, const uint32_t chunk_rank)
 {
-	ASSERT(required_rank >= CHUNK_RANKS && required_rank < CACHE_RANKS);
+	ASSERT(chunk_rank < CACHE_RANKS);
 
 	struct slice_alloc_span *span = cache->active;
-	uint32_t original_rank = find_slice(span, required_rank);
+	const uint32_t rank = chunk_rank >= BLOCK_RANKS ? chunk_rank : block_slice[chunk_rank];
+	uint32_t original_rank = find_slice(span, rank);
 	if (original_rank >= CACHE_RANKS) {
-		// Check for remotely freed chunks.
 		release_remote(cache);
-
-		original_rank = find_slice(span, required_rank);
-
-		// TODO: Try to coalesce freed memory in the active span.
+		coalesce_chunks(span);
+		original_rank = find_slice(span, rank);
 	}
 
 	if (original_rank >= CACHE_RANKS) {
@@ -1102,7 +1100,11 @@ alloc_slice(struct slice_cache *const cache, const uint32_t required_rank, const
 		struct slice_cache_node *node = list_head(&cache->staging);
 		while (node != list_stub(&cache->staging)) {
 			struct slice_alloc_span *next = containerof(node, struct slice_alloc_span, staging_node);
-			original_rank = find_slice(next, required_rank);
+			original_rank = find_slice(next, rank);
+			if (original_rank >= CACHE_RANKS) {
+				coalesce_chunks(next);
+				original_rank = find_slice(next, rank);
+			}
 			if (original_rank < CACHE_RANKS) {
 				next->status = SPAN_ACTIVE;
 				list_delete(node);
@@ -1121,7 +1123,7 @@ alloc_slice(struct slice_cache *const cache, const uint32_t required_rank, const
 			}
 
 			prepare_span(span);
-			original_rank = find_slice(span, required_rank);
+			original_rank = find_slice(span, rank);
 			ASSERT(original_rank < CACHE_RANKS);
 		}
 
@@ -1131,31 +1133,35 @@ alloc_slice(struct slice_cache *const cache, const uint32_t required_rank, const
 	}
 
 	// Remove the slice from the free list.
-	const uint32_t index = original_rank - CHUNK_RANKS;
-	const uint32_t base = span->slices[index];
-	span->slices[index] = decode_base(span->units[base + 2], span->units[base + 1]);
+	const uint32_t index = original_rank - BLOCK_RANKS;
+	void *const ptr = span->slices[index];
+	span->slices[index] = *((void **) ptr);
+
+	const uint32_t base = ((uint8_t *) ptr - (uint8_t *) span) / UNIT_SIZE;
 
 	// If the slice is bigger than required then split it.
-	if (original_rank != required_rank)
-		split_slice(span, base, original_rank, required_rank);
+	if (rank != original_rank)
+		split_slice(span, base, rank, original_rank);
 
-	if (!block) {
+	span->units[base] = chunk_rank;
+	if (chunk_rank >= BLOCK_RANKS) {
+		span->slice_num++;
+
 		// The slice is to be used as such.
-		span->units[base + 1] = 0;
-		span->units[base + 2] = 0;
+		span->units[base + 1] = (base & UNIT_LMASK) + BASE_LMIN;
+		span->units[base + 2] = (base >> UNIT_LBITS) + BASE_HMIN;
 
-		span->alloc_num++;
 	} else {
 		// The slice is to be used as a block. Fill the unit map.
 		const uint8_t bytes[4] = {
-			(base & UNIT_LMASK) | BASE_TAG,
-			base >> UNIT_LBITS,
-			(base & UNIT_LMASK) | BASE_TAG,
-			base >> UNIT_LBITS
+			(base & UNIT_LMASK) + BASE_LMIN,
+			(base >> UNIT_LBITS) + BASE_HMIN,
+			(base & UNIT_LMASK) + BASE_LMIN,
+			(base >> UNIT_LBITS) + BASE_HMIN,
 		};
 
 		uint8_t *const map = &span->units[base + 1];
-		const uint32_t end = memory_sizes[required_rank] / UNIT_SIZE - 1;
+		const uint32_t end = memory_sizes[rank] / UNIT_SIZE - 1;
 		const uint32_t loop_end = end & ~3u;
 		const uint32_t tail = end & 3u;
 
@@ -1173,167 +1179,94 @@ alloc_slice(struct slice_cache *const cache, const uint32_t required_rank, const
 		}
 	}
 
-	return (uint8_t *) span + base * UNIT_SIZE;
+	return ptr;
 }
 
-static struct outer_block *
-alloc_outer(struct slice_cache *const cache, const uint32_t rank)
+static struct block *
+alloc_block(struct slice_cache *const cache, const uint32_t rank)
 {
-	// Allocate a large chunk.
-	struct outer_block *const block = alloc_slice(cache, rank + OUTER_TO_SLICE, true);
-	if (unlikely(block == NULL))
-		return NULL;
-
-	// Set it up as a block.
-	block->inner_next = NULL;
-	block->inner_used = 0;
-	block->inner_free = 0;
-
-	// One slot is used for 'struct outer_block', another will be used for
-	// allocation right away.
-	block->chunk_free = 0xfffffffc;
-
 	// TODO: allocating a slice may take a span from the staging list with
 	// existing blocks of the required size. Thus we allocated a slice for
 	// no reason. Fix this.
 
+	// Allocate a large chunk.
+	struct block *const block = alloc_slice(cache, rank);
+	if (unlikely(block == NULL))
+		return NULL;
+	cache->active->block_num++;
+
 	// Cache the block for futher use.
-	block->next = cache->active->blocks[rank];
-	cache->active->blocks[rank] = block;
+	list_insert_first(&cache->active->blocks[rank], &block->node);
+
+	// Total number of slots.
+	const uint32_t size = block_size[rank];
+	// Slots used for 'struct block'.
+	const uint32_t used = block_used[rank];
+	block->free_num = block->free_max = size - used;
+
+	// Fill the free list.
+	const uint32_t step = memory_sizes[rank];
+	uint8_t *ptr = (uint8_t *) block + used * step;
+	uint8_t *const end = (uint8_t *) block + size * step;
+	block->free_list = ptr;
+	for (;;) {
+		uint8_t *const next = ptr + step;
+		if (next == end) {
+			*((void **) ptr) = NULL;
+			break;
+		}
+		*((void **) ptr) = next;
+		ptr = next;
+	}
 
 	return block;
 }
 
-static void *
+static inline void *
 alloc_chunk(struct slice_cache *const cache, const uint32_t rank)
 {
-	if (rank >= INNER_CHUNK_RANKS) {
-		// Handle medium sizes.
+	if (rank >= BLOCK_RANKS)
+		return alloc_slice(cache, rank);
 
-		// Use a cached block if any.
-		struct outer_block *block = cache->active->blocks[rank];
-		if (block != NULL) {
-			ASSERT(block->chunk_free);
-			const uint32_t shift = ctz(block->chunk_free);
-			block->chunk_free ^= (1ull << shift);
-			if (block->chunk_free == 0) {
-				// Remove a fully used block.
-				cache->active->blocks[rank] = block->next;
-			}
-
-			cache->active->alloc_num++;
-			return (uint8_t *) block + shift * memory_sizes[rank];
-		}
-
+	struct block *block;
+	struct slice_alloc_span *span = cache->active;
+	if (!list_empty(&span->blocks[rank])) {
+		// Use a cached block.
+		struct slice_cache_node *node = list_head(&span->blocks[rank]);
+		block = containerof(node, struct block, node);
+	} else {
 		// Allocate a new block.
-		block = alloc_outer(cache, rank);
+		block = alloc_block(cache, rank);
 		if (unlikely(block == NULL))
 			return NULL;
-
-		cache->active->alloc_num++;
-		return (uint8_t *) block + memory_sizes[rank];
-
-	} else {
-		// Handle small sizes.
-
-		// Use a cached inner block if any.
-		struct outer_block *block = cache->active->blocks[rank];
-		const uint32_t outer_rank = rank + INNER_TO_OUTER;
-		if (block != NULL) {
-			ASSERT(block->inner_free);
-			const uint32_t shift = ctz(block->inner_free);
-			uint8_t *const inner_base = ((uint8_t *) block) + shift * memory_sizes[outer_rank];
-
-			struct inner_block *const inner = (struct inner_block *) inner_base;
-			ASSERT(inner->free);
-			const uint32_t inner_shift = ctz(inner->free);
-			inner->free ^= (1u << inner_shift);
-			if (inner->free == 0) {
-				block->inner_free ^= (1ull << shift);
-				if (block->inner_free == 0) {
-					// Remove a fully used inner block.
-					cache->active->blocks[rank] = block->inner_next;
-				}
-			}
-
-			cache->active->alloc_num++;
-			return inner_base + inner_shift * memory_sizes[rank];
-		}
-
-		// Allocate am outer chunk and use it as an inner block.
-		uint8_t *inner_base;
-		block = cache->active->blocks[outer_rank];
-		if (block != NULL) {
-			// Use a cached outer block.
-			ASSERT(block->chunk_free);
-			const uint32_t shift = ctz(block->chunk_free);
-			// Mark a free outer chunk as an inner block.
-			block->inner_used |= (1ull << shift);
-			block->inner_free |= (1ull << shift);
-			block->chunk_free ^= (1ull << shift);
-			if (block->chunk_free == 0) {
-				// Remove a fully used outer block.
-				cache->active->blocks[outer_rank] = block->next;
-			}
-			inner_base = (uint8_t *) block + shift * memory_sizes[outer_rank];
-		} else {
-			// Allocate a new outer block.
-			block = alloc_outer(cache, outer_rank);
-			if (unlikely(block == NULL))
-				return NULL;
-			// Mark the first outer chunk as an inner block.
-			block->inner_used |= 2ull;
-			block->inner_free |= 2ull;
-			inner_base = (uint8_t *) block + memory_sizes[outer_rank];
-		}
-
-		// Mark the remaining small chunks as free.
-		((struct inner_block *) inner_base)->free = 0xfffc;
-
-		// TODO: allocating a slice may take a span from the staging list with
-		// existing blocks of the required size. Thus we allocated a slice for
-		// no reason. Fix this.
-
-		// Cache the block for futher use.
-		block->inner_next = cache->active->blocks[rank];
-		cache->active->blocks[rank] = block;
-
-		cache->active->alloc_num++;
-		return inner_base + memory_sizes[rank];
 	}
+
+	// Get a chunk from the free list.
+	void *ptr = block->free_list;
+	block->free_list = *((void **) ptr);
+
+	// If the block becomes empty delete it from the cache.
+	if (--(block->free_num) == 0)
+		list_delete(&block->node);
+
+	return ptr;
 }
 
-static uint32_t
+static inline uint32_t
 get_chunk_rank(const struct span_header *const hdr, const void *const ptr)
 {
-	// Identify the chunk.
 	struct slice_alloc_span *const span = (struct slice_alloc_span *) hdr;
 	const uint32_t base = deduce_base(span, ptr);
+	VERIFY(base >= 4 && base < UNIT_NUMBER, "bad pointer");
 	const uint8_t rank = span->units[base];
-	const uint8_t mark = span->units[base + 1];
-	VERIFY(rank >= CHUNK_RANKS && rank < CACHE_RANKS, "bad pointer");
-	VERIFY(mark == 0 || (mark & ~UNIT_LMASK) == BASE_TAG, "bad pointer");
-
-	// Handle a whole slice.
-	if (mark == 0)
-		return rank;
-
-	// Locate the outer block.
-	const uint32_t outer_rank = rank - OUTER_TO_SLICE;
-	struct outer_block *const block = (struct outer_block *) ((uint8_t *) span + base * UNIT_SIZE);
-	const uint32_t shift = (((uint8_t *) ptr - (uint8_t *) block) * memory_magic[outer_rank]) >> MAGIC_SHIFT;
-	VERIFY(shift > 0 || shift < 32, "bad pointer");
-
-	// Handle a chunk from the outer block.
-	const uint64_t mask = 1ull << shift;
-	if ((block->inner_used & mask) == 0)
-		return outer_rank;
-
-	// Handle a chunk from an inner block.
-	return outer_rank - INNER_TO_OUTER;
+	VERIFY(rank < CACHE_RANKS, "bad pointer");
+	VERIFY(span->units[base + 1] != FREE_TAG1, "already free");
+	VERIFY(span->units[base + 1] >= BASE_LMIN, "bad pointer");
+	VERIFY(span->units[base + 1] <= BASE_LMAX, "bad pointer");
+	return rank;
 }
 
-static uint32_t
+static inline uint32_t
 get_chunk_size(const struct span_header *const hdr, const void *const ptr)
 {
 	uint32_t rank = get_chunk_rank(hdr, ptr);
@@ -1350,7 +1283,7 @@ slice_cache_all_free(struct slice_cache *const cache)
 	struct slice_cache_node *node = list_head(&cache->staging);
 	while (node != list_stub(&cache->staging)) {
 		struct slice_alloc_span *span = containerof(node, struct slice_alloc_span, staging_node);
-		if (span->alloc_num != span->free_num)
+		if ((span->slice_num + span->block_num) != 0)
 			return false;
 		node = node->next;
 	}
@@ -1368,7 +1301,9 @@ slice_cache_collect_staging(struct slice_cache *const cache)
 	while (node != list_stub(&cache->staging)) {
 		struct slice_alloc_span *span = containerof(node, struct slice_alloc_span, staging_node);
 		struct slice_cache_node *next = node->next;
-		if (span->alloc_num == span->free_num) {
+		if (span->block_num != 0)
+			coalesce_chunks(span);
+		if ((span->slice_num + span->block_num) == 0) {
 			list_delete(node);
 			span_destroy(&span->header);
 		}
@@ -1401,7 +1336,7 @@ is_valid_alignment(const size_t alignment)
 static size_t
 chunk_alignment(const uint32_t rank)
 {
-	if (rank < CHUNK_RANKS) {
+	if (rank < BLOCK_RANKS) {
 		switch ((rank & 3)) {
 		case 0:
 			return memory_sizes[rank];
@@ -1483,15 +1418,13 @@ slice_cache_collect(struct slice_cache *const cache)
 	slice_cache_collect_staging(cache);
 }
 
-void *
+inline void *
 slice_cache_alloc(struct slice_cache *const cache, const size_t size)
 {
 	const uint32_t rank = get_rank(size);
 	if (rank < CACHE_RANKS) {
 		// Handle small, medium, and large sizes.
-		void *ptr = (rank < CHUNK_RANKS ?
-			     alloc_chunk(cache, rank) :
-			     alloc_slice(cache, rank, false));
+		void *ptr = alloc_chunk(cache, rank);
 		if (unlikely(ptr == NULL))
 			errno = ENOMEM;
 		return ptr;
@@ -1513,9 +1446,7 @@ slice_cache_zalloc(struct slice_cache *const cache, const size_t size)
 	const uint32_t rank = get_rank(size);
 	if (rank < CACHE_RANKS) {
 		// Handle small, medium, and large sizes.
-		void *ptr = (rank < CHUNK_RANKS ?
-			     alloc_chunk(cache, rank) :
-			     alloc_slice(cache, rank, false));
+		void *ptr = alloc_chunk(cache, rank);
 		if (unlikely(ptr == NULL))
 			errno = ENOMEM;
 		else
@@ -1557,9 +1488,7 @@ slice_cache_aligned_alloc(struct slice_cache *const cache, const size_t alignmen
 	if (rank < CACHE_RANKS) {
 		// Handle small, medium, and large sizes.
 		if (alignment <= chunk_alignment(rank)) {
-			void *ptr = (rank < CHUNK_RANKS ?
-				     alloc_chunk(cache, rank) :
-				     alloc_slice(cache, rank, false));
+			void *ptr = alloc_chunk(cache, rank);
 			if (unlikely(ptr == NULL))
 				errno = ENOMEM;
 			return ptr;
@@ -1599,9 +1528,7 @@ slice_cache_aligned_zalloc(struct slice_cache *const cache, const size_t alignme
 	if (rank < CACHE_RANKS) {
 		// Handle small, medium, and large sizes.
 		if (alignment <= chunk_alignment(rank)) {
-			void *ptr = (rank < CHUNK_RANKS ?
-				     alloc_chunk(cache, rank) :
-				     alloc_slice(cache, rank, false));
+			void *ptr = alloc_chunk(cache, rank);
 			if (unlikely(ptr == NULL))
 				errno = ENOMEM;
 			else
@@ -1644,13 +1571,6 @@ slice_cache_aligned_calloc(struct slice_cache *const cache, const size_t alignme
 void *
 slice_cache_realloc(struct slice_cache *const cache, void *const ptr, const size_t size)
 {
-	if (ptr == NULL) {
-		return slice_cache_alloc(cache, size);
-	} else if (size == 0) {
-		slice_cache_free_maybe_remotely(cache, ptr);
-		return NULL;
-	}
-
 	// Try to reuse the original chunk.
 	size_t old_size;
 	struct span_header *const hdr = span_from_ptr(ptr);
@@ -1676,55 +1596,27 @@ slice_cache_realloc(struct slice_cache *const cache, void *const ptr, const size
 		return NULL;
 
 	memcpy(new_ptr, ptr, min(old_size, size));
-	slice_cache_free_maybe_remotely(cache, ptr);
+	slice_cache_free(cache, ptr);
 
 	return new_ptr;
 }
 
-void
-slice_cache_free(struct slice_cache *const cache, void *const ptr)
+inline void
+slice_cache_free(struct slice_cache *const local_cache, void *const ptr)
 {
-	if (ptr == NULL)
-		return;
-
 	struct span_header *const hdr = span_from_ptr(ptr);
-	ASSERT(cache == hdr->cache);
-
-	if (span_is_singular(hdr)) {
-		// Free super-large chunks.
-		atomic_fetch_add_explicit(&cache->singular_free_num, 1, memory_order_relaxed);
-		span_destroy(hdr);
-		return;
-	}
-
-	// Free chunks from regular spans.
-	free_chunk((struct slice_alloc_span *) hdr, ptr);
-}
-
-void
-slice_cache_free_maybe_remotely(struct slice_cache *const local_cache, void *const ptr)
-{
-	if (ptr == NULL)
-		return;
-
-	struct span_header *const hdr = span_from_ptr(ptr);
-
-	if (span_is_singular(hdr)) {
-		// Free super-large chunks.
-		atomic_fetch_add_explicit(&hdr->cache->singular_free_num, 1, memory_order_relaxed);
-		span_destroy(hdr);
-		return;
-	}
-
-	// Free chunks from regular spans.
-	if (hdr->cache == local_cache) {
-		// Nice, this is a local free actually.
+	if (likely(hdr->cache == local_cache) && likely(span_is_regular(hdr))) {
+		// Nice, this is a regular local free.
 		free_chunk((struct slice_alloc_span *) hdr, ptr);
-	} else {
+	} else if (likely(span_is_regular(hdr))) {
 		// Well, this is really a remote free.
 		struct slice_cache_mpsc_node *const link = ptr;
 		mpsc_qlink_prepare(link);
 		mpsc_queue_append(&hdr->cache->remote_free_list, link);
+	} else {
+		// Free super-large chunks.
+		atomic_fetch_add_explicit(&hdr->cache->singular_free_num, 1, memory_order_relaxed);
+		span_destroy(hdr);
 	}
 }
 
@@ -1774,6 +1666,8 @@ slice_usable_size(const void *const ptr)
 {
 	if (ptr == NULL)
 		return 0;
+
+	// TODO: support over-aligned chunks
 
 	const struct span_header *const hdr = span_from_ptr(ptr);
 	if (span_is_singular(hdr)) {
@@ -1942,6 +1836,13 @@ slice_aligned_calloc(const size_t alignment, const size_t num, const size_t size
 void *
 slice_realloc(void *const ptr, const size_t size)
 {
+	if (ptr == NULL) {
+		return slice_alloc(size);
+	} else if (size == 0) {
+		slice_free(ptr);
+		return NULL;
+	}
+
 	struct slice_cache *cache = get_local_cache();
 	if (unlikely(cache == NULL)) {
 		errno = ENOMEM;
@@ -1953,7 +1854,8 @@ slice_realloc(void *const ptr, const size_t size)
 void
 slice_free(void *const ptr)
 {
-	slice_cache_free_maybe_remotely(local_cache, ptr);
+	if (ptr != NULL)
+		slice_cache_free(local_cache, ptr);
 }
 
 /**********************************************************************

@@ -123,9 +123,6 @@ slice_cache_realloc(struct slice_cache *cache, void *ptr, size_t size);
 void
 slice_cache_free(struct slice_cache *cache, void *ptr);
 
-void
-slice_cache_free_maybe_remotely(struct slice_cache *local_cache, void *ptr);
-
 size_t
 slice_usable_size(const void *ptr);
 
