@@ -597,6 +597,7 @@ span_destroy(struct span_header *const hdr)
     value >= 0x00 --   0 -- 0 0 0 0 | 0 0 0 0
     value <= 0x3f --  63 -- 0 0 1 1 | 1 1 1 1
     0 0 x x | x x x x
+  [ for blocks also repeated at bytes 4, 8, ... ]
 
   byte 1
   ------
@@ -604,7 +605,7 @@ span_destroy(struct span_header *const hdr)
     value >= 0x40 --  64 -- 0 1  0 0 | 0 0 0 0
     value <= 0x7f -- 127 -- 0 1  1 1 | 1 1 1 1
     0 1 x x | x x x x
-  [ for blocks also repeated at bytes 3, 5, ... ]
+  [ for blocks also repeated at bytes 5, 9, ... ]
 
   for a free slice
     value == 0xfe -- 254
@@ -616,11 +617,32 @@ span_destroy(struct span_header *const hdr)
     value >= 0x80 -- 128 -- 1 0 0 0 | 0 0 0 0
     value <= 0x9f -- 159 -- 1 0 0 1 | 1 1 1 1
     1 0 x x | x x x x
-  [ for blocks also repeated at bytes 4, 6, ... ]
+  [ for blocks also repeated at bytes 6, 10, ... ]
 
   for a free slice
     value == 0xff -- 255
     1 1 1 1 | 1 1 1 1
+
+  byte 3
+  ------
+  for a used slice
+    value == 0xa0 -- 160 -- 1 0 1 0 | 0 0 0 0
+  [ for blocks also repeated at bytes 7, 11, ... ]
+
+  byte 4*n
+  --------
+  for a used slice
+    value == 0xb0 -- 176 -- 1 0 1 1 | 0 0 0 0
+
+  byte 4*n + 1
+  ------------
+  for a used slice
+    value == 0xc0 -- 192 -- 1 1 0 0 | 0 0 0 0
+
+  byte 4*n + 2
+  ------------
+  for a used slice
+    value == 0xd0 -- 208 -- 1 1 0 1 | 0 0 0 0
 
 */
 
