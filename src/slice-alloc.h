@@ -29,62 +29,7 @@
 extern "C" {
 #endif
 
-// CPU cache-line size.
-#define SLICE_CACHE_ALIGN		__attribute__((__aligned__(64)))
-
 struct slice_cache;
-
-struct slice_cache_node
-{
-	struct slice_cache_node *next;
-	struct slice_cache_node *prev;
-};
-
-struct slice_cache_list
-{
-	struct slice_cache_node node;
-};
-
-struct slice_cache_mpsc_node
-{
-	 struct slice_cache_mpsc_node *_Atomic next;
-};
-
-struct slice_cache_mpsc_queue
-{
-	SLICE_CACHE_ALIGN struct slice_cache_mpsc_node *_Atomic tail;
-	SLICE_CACHE_ALIGN struct slice_cache_mpsc_node *head;
-	struct slice_cache_mpsc_node stub;
-};
-
-/*
- * Cache release callback. It is safe to destroy a cache only
- * after the last memory chunk from it is released. Thus this
- * callback is used to notify about this event.
- */
-typedef void (*slice_cache_release_t)(struct slice_cache *cache);
-
-/*
- * A memory allocation cache.
- */
-struct slice_cache
-{
-	/* The active span to allocate memory from. */
-	struct slice_alloc_span *active;
-
-	/* Inactive spans to gather freed memory. */
-	struct slice_cache_list staging;
-
-	/* Release list node.*/
-	struct slice_cache_node release_node;
-
-	/* Statistics. */
-	uint64_t singular_alloc_num;
-	uint64_t _Atomic singular_free_num;
-
-	/* The list of chunks freed remotely. */
-	struct slice_cache_mpsc_queue remote_free_list;
-};
 
 struct slice_cache *
 slice_cache_create(void);
