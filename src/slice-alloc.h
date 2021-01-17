@@ -62,7 +62,7 @@ struct slice_cache_mpsc_queue
  * after the last memory chunk from it is released. Thus this
  * callback is used to notify about this event.
  */
-typedef void (*slice_cache_release_t)(struct slice_cache *cache, void *data);
+typedef void (*slice_cache_release_t)(struct slice_cache *cache);
 
 /*
  * A memory allocation cache.
@@ -77,10 +77,6 @@ struct slice_cache
 
 	/* Release list node.*/
 	struct slice_cache_node release_node;
-	/* Release callback. */
-	slice_cache_release_t release_callback;
-	/* Release callback user data. */
-	void *release_callback_data;
 
 	/* Statistics. */
 	uint64_t singular_alloc_num;
@@ -90,11 +86,11 @@ struct slice_cache
 	struct slice_cache_mpsc_queue remote_free_list;
 };
 
-void
-slice_cache_prepare(struct slice_cache *cache);
+struct slice_cache *
+slice_cache_create(void);
 
 void
-slice_cache_cleanup(struct slice_cache *cache, slice_cache_release_t cb, void *cb_data);
+slice_cache_destroy(struct slice_cache *cache);
 
 void
 slice_cache_collect(struct slice_cache *cache);

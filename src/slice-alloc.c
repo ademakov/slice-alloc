@@ -1308,52 +1308,6 @@ get_chunk_size(const struct span_header *const hdr, const void *const ptr)
 	return memory_sizes[rank];
 }
 
-/**********************************************************************
- * Slice cache management.
- **********************************************************************/
-
-static bool
-slice_cache_all_free(struct slice_cache *const cache)
-{
-	struct slice_cache_node *node = list_head(&cache->staging);
-	while (node != list_stub(&cache->staging)) {
-		struct slice_alloc_span *span = containerof(node, struct slice_alloc_span, staging_node);
-		if ((span->slice_num + span->block_num) != 0)
-			return false;
-		node = node->next;
-	}
-
-	if (cache->singular_alloc_num != atomic_load_explicit(&cache->singular_free_num, memory_order_relaxed))
-		return false;
-
-	return true;
-}
-
-static void
-slice_cache_collect_staging(struct slice_cache *const cache)
-{
-	struct slice_cache_node *node = list_head(&cache->staging);
-	while (node != list_stub(&cache->staging)) {
-		struct slice_alloc_span *span = containerof(node, struct slice_alloc_span, staging_node);
-		struct slice_cache_node *next = node->next;
-		if (span->block_num != 0)
-			coalesce_chunks(span);
-		if ((span->slice_num + span->block_num) == 0) {
-			list_delete(node);
-			span_destroy(&span->header);
-		}
-		node = next;
-	}
-}
-
-static void
-slice_cache_release(struct slice_cache *const cache)
-{
-	if (cache->release_callback != NULL) {
-		(cache->release_callback)(cache, cache->release_callback_data);
-	}
-}
-
 static inline bool
 is_valid_alignment(const size_t alignment)
 {
@@ -1387,21 +1341,59 @@ chunk_alignment(const uint32_t rank)
 }
 
 /**********************************************************************
- * Slice cache management - public API.
+ * Slice cache management.
  **********************************************************************/
 
-/* Pending cache release list. */
-static struct slice_cache_list slice_cache_release_list = {
+// The initial cache (contains other caches).
+static struct slice_cache initial_cache;
+
+static spinlock_t initial_cache_lock = SPINLOCK_INIT;
+static spinlock_t cache_release_lock = SPINLOCK_INIT;
+
+// Pending cache release list.
+static struct slice_cache_list cache_release_list = {
 	.node = {
-		.next = &slice_cache_release_list.node,
-		.prev = &slice_cache_release_list.node,
+		.next = &cache_release_list.node,
+		.prev = &cache_release_list.node,
 	}
 };
 
-static spinlock_t slice_cache_release_list_lock = SPINLOCK_INIT;
+static bool
+cache_is_all_free(struct slice_cache *const cache)
+{
+	struct slice_cache_node *node = list_head(&cache->staging);
+	while (node != list_stub(&cache->staging)) {
+		struct slice_alloc_span *span = containerof(node, struct slice_alloc_span, staging_node);
+		if ((span->slice_num + span->block_num) != 0)
+			return false;
+		node = node->next;
+	}
 
-void
-slice_cache_prepare(struct slice_cache *const cache)
+	if (cache->singular_alloc_num != atomic_load_explicit(&cache->singular_free_num, memory_order_relaxed))
+		return false;
+
+	return true;
+}
+
+static void
+collect_staging(struct slice_cache *const cache)
+{
+	struct slice_cache_node *node = list_head(&cache->staging);
+	while (node != list_stub(&cache->staging)) {
+		struct slice_alloc_span *span = containerof(node, struct slice_alloc_span, staging_node);
+		struct slice_cache_node *next = node->next;
+		if (span->block_num != 0)
+			coalesce_chunks(span);
+		if ((span->slice_num + span->block_num) == 0) {
+			list_delete(node);
+			span_destroy(&span->header);
+		}
+		node = next;
+	}
+}
+
+static void
+prepare_cache(struct slice_cache *const cache)
 {
 	list_prepare(&cache->staging);
 
@@ -1416,13 +1408,43 @@ slice_cache_prepare(struct slice_cache *const cache)
 	cache->singular_free_num = 0;
 }
 
-void
-slice_cache_cleanup(struct slice_cache *const cache, slice_cache_release_t cb, void *cb_data)
+static void
+release_cache(struct slice_cache *cache)
 {
-	// Store the release callback.
-	cache->release_callback = cb;
-	cache->release_callback_data = cb_data;
+	if (cache != &initial_cache) {
+		spin_lock(&initial_cache_lock);
+		slice_cache_free(&initial_cache, cache);
+		spin_unlock(&initial_cache_lock);
+	}
+	slice_scrap_collect();
+}
 
+/**********************************************************************
+ * Slice cache management - public API.
+ **********************************************************************/
+
+struct slice_cache *
+slice_cache_create(void)
+{
+	struct slice_cache *cache;
+
+	// Allocate the cache.
+	spin_lock(&initial_cache_lock);
+	if (unlikely(initial_cache.active == NULL))
+		prepare_cache(&initial_cache);
+	cache = slice_cache_alloc(&initial_cache, sizeof(struct slice_cache));
+	spin_unlock(&initial_cache_lock);
+
+	// Initialize the cache.
+	if (cache != NULL)
+		prepare_cache(cache);
+
+	return cache;
+}
+
+void
+slice_cache_destroy(struct slice_cache *cache)
+{
 	// Move the active span to the staging list.
 	if (cache->active != NULL) {
 		list_insert_first(&cache->staging, &cache->active->staging_node);
@@ -1431,15 +1453,52 @@ slice_cache_cleanup(struct slice_cache *const cache, slice_cache_release_t cb, v
 	}
 
 	// Try to free all the spans in the staging list.
-	slice_cache_collect_staging(cache);
-	if (slice_cache_all_free(cache)) {
+	collect_staging(cache);
+	if (cache_is_all_free(cache)) {
 		// If done then release the cache immediately.
-		slice_cache_release(cache);
+		release_cache(cache);
 	} else {
 		// If not then keep the cache around for a while.
-		spin_lock(&slice_cache_release_list_lock);
-		list_insert_first(&slice_cache_release_list, &cache->release_node);
-		spin_unlock(&slice_cache_release_list_lock);
+		spin_lock(&cache_release_lock);
+		list_insert_first(&cache_release_list, &cache->release_node);
+		spin_unlock(&cache_release_lock);
+	}
+}
+
+void
+slice_scrap_collect(void)
+{
+	struct slice_cache_list list;
+	list_prepare(&list);
+
+	if (spin_try_lock(&cache_release_lock)) {
+		if (!list_empty(&cache_release_list)) {
+			list_splice_first(&list,
+					  list_head(&cache_release_list),
+					  list_tail(&cache_release_list));
+			list_prepare(&cache_release_list);
+		}
+		spin_unlock(&cache_release_lock);
+
+		struct slice_cache_node *node = list_head(&list);
+		while (node != list_stub(&list)) {
+			struct slice_cache *cache = containerof(node, struct slice_cache, release_node);
+			struct slice_cache_node *next = node->next;
+			collect_staging(cache);
+			if (cache_is_all_free(cache)) {
+				list_delete(node);
+				release_cache(cache);
+			}
+			node = next;
+		}
+
+		if (!list_empty(&list)) {
+			spin_lock(&cache_release_lock);
+			list_splice_first(&cache_release_list,
+					  list_head(&list),
+					  list_tail(&list));
+			spin_unlock(&cache_release_lock);
+		}
 	}
 }
 
@@ -1450,7 +1509,7 @@ slice_cache_collect(struct slice_cache *const cache)
 	release_remote(cache);
 
 	// Try to free some spans in the staging list.
-	slice_cache_collect_staging(cache);
+	collect_staging(cache);
 }
 
 inline void *
@@ -1661,47 +1720,6 @@ slice_cache_free(struct slice_cache *const local_cache, void *const ptr)
 	}
 }
 
-/**********************************************************************
- * Common functions - public API.
- **********************************************************************/
-
-void
-slice_scrap_collect(void)
-{
-	struct slice_cache_list list;
-	list_prepare(&list);
-
-	if (spin_try_lock(&slice_cache_release_list_lock)) {
-		if (!list_empty(&slice_cache_release_list)) {
-			list_splice_first(&list,
-					  list_head(&slice_cache_release_list),
-					  list_tail(&slice_cache_release_list));
-			list_prepare(&slice_cache_release_list);
-		}
-		spin_unlock(&slice_cache_release_list_lock);
-
-		struct slice_cache_node *node = list_head(&list);
-		while (node != list_stub(&list)) {
-			struct slice_cache *cache = containerof(node, struct slice_cache, release_node);
-			struct slice_cache_node *next = node->next;
-			slice_cache_collect_staging(cache);
-			if (slice_cache_all_free(cache)) {
-				list_delete(node);
-				slice_cache_release(cache);
-			}
-			node = next;
-		}
-
-		if (!list_empty(&list)) {
-			spin_lock(&slice_cache_release_list_lock);
-			list_splice_first(&slice_cache_release_list,
-					  list_head(&list),
-					  list_tail(&list));
-			spin_unlock(&slice_cache_release_list_lock);
-		}
-	}
-}
-
 size_t
 slice_usable_size(const void *const ptr)
 {
@@ -1724,54 +1742,35 @@ slice_usable_size(const void *const ptr)
  * Thread-specific memory management - public API.
  **********************************************************************/
 
-// Thread-local cache.
 #if 1
 # define TLS_ATTR
 #else
 # define TLS_ATTR __attribute__((tls_model("initial-exec")))
 #endif
-static __thread struct slice_cache *local_cache TLS_ATTR = NULL;
 
 // This is used for thread-local cache cleanup.
 static pthread_key_t local_cache_key;
 static pthread_once_t local_cache_once = PTHREAD_ONCE_INIT;
 
-// Initial cache used for bootstrapping.
-static struct slice_cache initial_cache;
-static spinlock_t initial_cache_lock = SPINLOCK_INIT;
+// Thread-local cache.
+static __thread struct slice_cache *local_cache TLS_ATTR = NULL;
 
 static void
-release_local_cache(struct slice_cache *cache, void *data __attribute__((unused)))
+destroy_local_cache(void *ptr)
 {
-	if (cache != &initial_cache) {
-		spin_lock(&initial_cache_lock);
-		slice_cache_free(&initial_cache, cache);
-		spin_unlock(&initial_cache_lock);
-	} else {
-		pthread_key_delete(local_cache_key);
-	}
-	slice_scrap_collect();
+	slice_cache_destroy((struct slice_cache *) ptr);
 }
 
 static void
 destroy_initial_cache(void)
 {
-	slice_cache_cleanup(&initial_cache, release_local_cache, NULL);
-}
-
-static void
-destroy_local_cache(void *ptr)
-{
-	slice_cache_cleanup((struct slice_cache *) ptr, release_local_cache, NULL);
+	pthread_key_delete(local_cache_key);
+	slice_cache_destroy(&initial_cache);
 }
 
 static void
 prepare_local_cache(void)
 {
-	// Create initial cache.
-	slice_cache_prepare(&initial_cache);
-	local_cache = &initial_cache;
-
 	// Create the key needed for cleanup on thread exit.
 	pthread_key_create(&local_cache_key, destroy_local_cache);
 
@@ -1784,19 +1783,14 @@ get_local_cache(void)
 {
 	struct slice_cache *cache = local_cache;
 	if (unlikely(cache == NULL)) {
-		// Initialize global data needed for local caches if needed.
-		pthread_once(&local_cache_once, prepare_local_cache);
-
 		// Create a new local cache.
-		spin_lock(&initial_cache_lock);
-		cache = slice_cache_alloc(&initial_cache, sizeof(struct slice_cache));
-		spin_unlock(&initial_cache_lock);
+		cache = slice_cache_create();
 		if (cache == NULL)
 			return NULL;
-		slice_cache_prepare(cache);
 		local_cache = cache;
 
 		// This is only for cleanup. We don't use pthread_getspecific().
+		pthread_once(&local_cache_once, prepare_local_cache);
 		pthread_setspecific(local_cache_key, cache);
 	}
 	return cache;
