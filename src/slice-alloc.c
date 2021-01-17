@@ -1805,12 +1805,8 @@ get_local_cache(void)
 void
 slice_local_collect(void)
 {
-	struct slice_cache *cache = get_local_cache();
-	if (unlikely(cache == NULL)) {
-		errno = ENOMEM;
-		return;
-	}
-	slice_cache_collect(cache);
+	if (local_cache != NULL)
+		slice_cache_collect(local_cache);
 }
 
 void *
