@@ -651,10 +651,12 @@ typedef enum
 #define UNIT_LMASK		((1u << UNIT_LBITS) - 1u)
 #define UNIT_HMASK		((1u << UNIT_HBITS) - 1u)
 
-#define BASE_LMIN		CACHE_RANKS
-#define BASE_LMAX		(BASE_LMIN + UNIT_LMASK)
-#define BASE_HMIN		(BASE_LMAX + 1)
-#define BASE_HMAX		(BASE_HMIN + UNIT_HMASK)
+#define BASE_LFLAG		(4u << 4u)
+#define BASE_HFLAG		(8u << 4u)
+#define BASE_STUB3		(10u << 4u)
+#define BASE_STUB4		(11u << 4u)
+#define BASE_STUB5		(12u << 4u)
+#define BASE_STUB6		(13u << 4u)
 
 #define FREE_TAG1		(254u)
 #define FREE_TAG2		(255u)
@@ -753,27 +755,43 @@ get_rank(size_t size)
 }
 
 static inline uint32_t
-decode_base(uint8_t hi, uint8_t lo)
+unit_from_ptr(const struct slice_alloc_span *const span, const void *ptr)
 {
-	return (((uint32_t) hi - BASE_HMIN) << UNIT_LBITS) + (uint32_t) lo - BASE_LMIN;
+#if 0
+	return ((uintptr_t) ptr & SPAN_ALIGNMENT_MASK) / UNIT_SIZE;
+#else
+	return ((uintptr_t) ptr - (uintptr_t) span) / UNIT_SIZE;
+#endif
 }
 
-static uint32_t
-deduce_base(const struct slice_alloc_span *const span, const void *const ptr)
+static inline uint32_t
+find_slice_info(const struct slice_alloc_span *const span, const uint32_t unit)
 {
-	const uint32_t offset = (uint8_t *) ptr - (uint8_t *) span;
-	const uint32_t unit = offset / UNIT_SIZE;
+	const uint8_t index = span->units[unit] >> 4u;
+	VERIFY(index < 14u, "bad pointer");
 
-	const uint8_t x = span->units[unit];
-	if (x >= BASE_LMIN) {
-		const uint8_t y = span->units[unit - 1];
-		if (x >= BASE_HMIN)
-			return decode_base(x, y);
-		if (y >= BASE_HMIN)
-			return decode_base(y, x);
-		return unit - 1;
-	}
-	return unit;
+	static uint8_t table[] = {
+		0, 0, 0, 0,
+		1, 1, 1, 1,
+		2, 2, 3, 4,
+		5, 6, 7, 8
+	};
+
+	return unit - table[index];
+}
+
+static inline uint32_t
+get_slice_rank(const struct slice_alloc_span *const span, const uint32_t unit)
+{
+	return span->units[unit];
+}
+
+static inline uint32_t
+get_slice_base(const struct slice_alloc_span *const span, const uint32_t unit)
+{
+	const uint32_t lo = span->units[unit + 1] & UNIT_LMASK;
+	const uint32_t hi = span->units[unit + 2] & UNIT_HMASK;
+	return lo | (hi << UNIT_LBITS);
 }
 
 static void
@@ -1019,8 +1037,8 @@ coalesce_chunks(struct slice_alloc_span *const span)
 			struct block *block = containerof(node, struct block, node);
 			struct slice_cache_node *next = node->next;
 			if (block->free_num == block->free_max) {
-				const uint32_t offset = (uint8_t *) block - (uint8_t *) span;
-				span->units[offset / UNIT_SIZE] = block_slice[rank];
+				const uint32_t base = unit_from_ptr(span, block);
+				span->units[base] = block_slice[rank];
 				list_delete(&block->node);
 				span->block_num--;
 			}
@@ -1035,13 +1053,13 @@ static inline void
 free_chunk(struct slice_alloc_span *const span, void *const ptr)
 {
 	// Identify the chunk.
-	const uint32_t base = deduce_base(span, ptr);
-	VERIFY(base >= 4 && base < UNIT_NUMBER, "bad pointer");
-	const uint8_t rank = span->units[base];
+	const uint32_t unit = unit_from_ptr(span, ptr);
+	const uint32_t info = find_slice_info(span, unit);
+	const uint32_t rank = get_slice_rank(span, info);
 	VERIFY(rank < CACHE_RANKS, "bad pointer");
+	const uint32_t base = get_slice_base(span, info);
+	VERIFY(base >= 4 && base < UNIT_NUMBER, "bad pointer");
 	VERIFY(span->units[base + 1] != FREE_TAG1, "double free");
-	VERIFY(span->units[base + 1] >= BASE_LMIN, "bad pointer");
-	VERIFY(span->units[base + 1] <= BASE_LMAX, "bad pointer");
 
 	if (rank >= BLOCK_RANKS) {
 		// Free a whole slice.
@@ -1133,49 +1151,47 @@ alloc_slice(struct slice_cache *const cache, const uint32_t chunk_rank)
 	}
 
 	// Remove the slice from the free list.
-	const uint32_t index = original_rank - BLOCK_RANKS;
-	void *const ptr = span->slices[index];
-	span->slices[index] = *((void **) ptr);
+	void *const ptr = span->slices[original_rank - BLOCK_RANKS];
+	span->slices[original_rank - BLOCK_RANKS] = *((void **) ptr);
 
-	const uint32_t base = ((uint8_t *) ptr - (uint8_t *) span) / UNIT_SIZE;
+	const uint32_t base = unit_from_ptr(span, ptr);
 
 	// If the slice is bigger than required then split it.
 	if (rank != original_rank)
 		split_slice(span, base, rank, original_rank);
 
-	span->units[base] = chunk_rank;
+	// Make the unit map pattern.
+	const uint8_t pattern[4] = {
+		chunk_rank,
+		(base & UNIT_LMASK) + BASE_LFLAG,
+		(base >> UNIT_LBITS) + BASE_HFLAG,
+		BASE_STUB3
+	};
+
+	uint8_t *map = &span->units[base];
 	if (chunk_rank >= BLOCK_RANKS) {
+		// The slice is to be used as such.
 		span->slice_num++;
 
-		// The slice is to be used as such.
-		span->units[base + 1] = (base & UNIT_LMASK) + BASE_LMIN;
-		span->units[base + 2] = (base >> UNIT_LBITS) + BASE_HMIN;
+		// Fill the unit map at the start only.
+		memcpy(map, pattern, 4);
 
 	} else {
-		// The slice is to be used as a block. Fill the unit map.
-		const uint8_t bytes[4] = {
-			(base & UNIT_LMASK) + BASE_LMIN,
-			(base >> UNIT_LBITS) + BASE_HMIN,
-			(base & UNIT_LMASK) + BASE_LMIN,
-			(base >> UNIT_LBITS) + BASE_HMIN,
-		};
+		// The slice is to be used as a block.
+		span->block_num++;
 
-		uint8_t *const map = &span->units[base + 1];
-		const uint32_t end = memory_sizes[rank] / UNIT_SIZE - 1;
-		const uint32_t loop_end = end & ~3u;
-		const uint32_t tail = end & 3u;
-
-		uint32_t i = 0;
-		while (i < loop_end) {
-			memcpy(&map[i], bytes, 4);
-			i += 4;
+		// Fill the unit map for the whole slice.
+		uint32_t num = memory_sizes[rank] / UNIT_SIZE;
+		while (num >= 4) {
+			memcpy(map, pattern, 4);
+			map += 4;
+			num -= 4;
 		}
-		if ((tail & 2) != 0) {
-			memcpy(&map[i], bytes, 2);
-			i += 2;
-		}
-		if ((tail & 1) != 0) {
-			map[i] = bytes[0];
+		if (num > 0) {
+			static uint8_t tail[] = {
+				BASE_STUB4, BASE_STUB5, BASE_STUB6
+			};
+			memcpy(map, tail, num);
 		}
 	}
 
@@ -1193,7 +1209,6 @@ alloc_block(struct slice_cache *const cache, const uint32_t rank)
 	struct block *const block = alloc_slice(cache, rank);
 	if (unlikely(block == NULL))
 		return NULL;
-	cache->active->block_num++;
 
 	// Cache the block for futher use.
 	list_insert_first(&cache->active->blocks[rank], &block->node);
@@ -1256,13 +1271,11 @@ static inline uint32_t
 get_chunk_rank(const struct span_header *const hdr, const void *const ptr)
 {
 	struct slice_alloc_span *const span = (struct slice_alloc_span *) hdr;
-	const uint32_t base = deduce_base(span, ptr);
-	VERIFY(base >= 4 && base < UNIT_NUMBER, "bad pointer");
-	const uint8_t rank = span->units[base];
+	const uint32_t unit = unit_from_ptr(span, ptr);
+	const uint32_t info = find_slice_info(span, unit);
+	VERIFY(info >= 4 && info < UNIT_NUMBER, "bad pointer");
+	const uint32_t rank = get_slice_rank(span, info);
 	VERIFY(rank < CACHE_RANKS, "bad pointer");
-	VERIFY(span->units[base + 1] != FREE_TAG1, "already free");
-	VERIFY(span->units[base + 1] >= BASE_LMIN, "bad pointer");
-	VERIFY(span->units[base + 1] <= BASE_LMAX, "bad pointer");
 	return rank;
 }
 
@@ -1605,6 +1618,12 @@ inline void
 slice_cache_free(struct slice_cache *const local_cache, void *const ptr)
 {
 	struct span_header *const hdr = span_from_ptr(ptr);
+	if (unlikely(hdr == NULL)) {
+		if (likely(ptr == 0))
+			return;
+		abort();
+	}
+
 	if (likely(hdr->cache == local_cache) && likely(span_is_regular(hdr))) {
 		// Nice, this is a regular local free.
 		free_chunk((struct slice_alloc_span *) hdr, ptr);
@@ -1684,7 +1703,12 @@ slice_usable_size(const void *const ptr)
  **********************************************************************/
 
 // Thread-local cache.
-static __thread struct slice_cache *local_cache = NULL;
+#if 1
+# define TLS_ATTR
+#else
+# define TLS_ATTR __attribute__((tls_model("initial-exec")))
+#endif
+static __thread struct slice_cache *local_cache TLS_ATTR = NULL;
 
 // This is used for thread-local cache cleanup.
 static pthread_key_t local_cache_key;
@@ -1854,8 +1878,7 @@ slice_realloc(void *const ptr, const size_t size)
 void
 slice_free(void *const ptr)
 {
-	if (ptr != NULL)
-		slice_cache_free(local_cache, ptr);
+	slice_cache_free(local_cache, ptr);
 }
 
 /**********************************************************************
