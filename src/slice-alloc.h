@@ -1,7 +1,7 @@
 /*
  * slice-alloc - a memory allocation library.
  *
- * Copyright (C) 2020  Aleksey Demakov
+ * Copyright (C) 2020,2021  Aleksey Demakov
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -23,7 +23,6 @@
 #define SLICE_ALLOC_H
 
 #include <stddef.h>
-#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {

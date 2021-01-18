@@ -1,7 +1,7 @@
 /*
  * slice-alloc - a memory allocation library.
  *
- * Copyright (C) 2020  Aleksey Demakov
+ * Copyright (C) 2020,2021  Aleksey Demakov
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <stdnoreturn.h>
 #include <string.h>
@@ -415,8 +416,6 @@ struct span_header
 {
 	// The tag for regular spans or usable size for singular spans.
 	size_t tag_or_size;
-	// The memory size that is actually mmap()-ed.
-	size_t virtual_size;
 
 	// The memory cache the span belongs to.
 	struct slice_cache *cache;
@@ -427,6 +426,8 @@ struct singular_span
 {
 	struct span_header header;
 
+	// The memory size that is actually mmap()-ed.
+	size_t virtual_size;
 	// The offset of the allocated memory chunk.
 	size_t offset;
 };
@@ -447,13 +448,6 @@ span_from_ptr(const void *ptr)
 	return (struct span_header *) ((uintptr_t) ptr & ~SPAN_ALIGNMENT_MASK);
 }
 
-// Get the actual size of virtual memory occupied by the span.
-static inline size_t
-span_virtual_size(const struct span_header *hdr)
-{
-	return hdr->virtual_size;
-}
-
 // Check to see if the span is for regular chunks.
 static inline bool
 span_is_regular(const struct span_header *hdr)
@@ -469,16 +463,22 @@ span_is_singular(const struct span_header *hdr)
 }
 
 static inline size_t
-span_singular_size(const struct span_header *hdr)
+span_singular_size(const struct singular_span *span)
 {
-	return hdr->tag_or_size;
+	return span->header.tag_or_size;
+}
+
+// Get the actual size of virtual memory occupied by the span.
+static inline size_t
+span_singular_virtual_size(const struct singular_span *span)
+{
+	return span->virtual_size;
 }
 
 static inline void *
-span_singular_data(const struct span_header *hdr)
+span_singular_data(const struct singular_span *span)
 {
-	const struct singular_span *span = containerof(hdr, struct singular_span, header);
-	return (uint8_t *) hdr + span->offset;
+	return (uint8_t *) span + span->offset;
 }
 
 static void
@@ -532,18 +532,6 @@ span_alloc_space(const size_t size, const size_t addr_mask)
 	return addr;
 }
 
-static struct span_header *
-span_create_regular(struct slice_cache *const cache)
-{
-	struct span_header *hdr = span_alloc_space(SPAN_REGULAR_SIZE, SPAN_ALIGNMENT_MASK);
-	if (likely(hdr != NULL)) {
-		hdr->tag_or_size = SPAN_REGULAR_TAG;
-		hdr->virtual_size = SPAN_REGULAR_SIZE;
-		hdr->cache = cache;
-	}
-	return hdr;
-}
-
 static inline struct singular_span_params
 span_compute_singular(const size_t size, const size_t alignment)
 {
@@ -564,7 +552,7 @@ span_compute_singular(const size_t size, const size_t alignment)
 	return (struct singular_span_params) { total_size, offset };
 }
 
-static struct span_header *
+static struct singular_span *
 span_create_singular(struct slice_cache *const cache, const size_t size, const size_t alignment)
 {
 	const struct singular_span_params params = span_compute_singular(size, alignment);
@@ -574,17 +562,17 @@ span_create_singular(struct slice_cache *const cache, const size_t size, const s
 	struct singular_span *span = span_alloc_space(params.virtual_size, SPAN_ALIGNMENT_MASK);
 	if (likely(span != NULL)) {
 		span->header.tag_or_size = params.virtual_size - params.offset;
-		span->header.virtual_size = params.virtual_size;
 		span->header.cache = cache;
+		span->virtual_size = params.virtual_size;
 		span->offset = params.offset;
 	}
-	return &span->header;
+	return span;
 }
 
 static void
-span_destroy(struct span_header *const hdr)
+span_destroy_singular(struct singular_span *const span)
 {
-	span_free_space(hdr, span_virtual_size(hdr));
+	span_free_space(span, span_singular_virtual_size(span));
 }
 
 /**********************************************************************
@@ -743,10 +731,19 @@ struct block
 	struct node node;
 };
 
+// A group of regular spans allocated at once.
+struct regular_extent
+{
+	uint8_t *base;
+	uint64_t free;
+	struct node node;
+};
+
 // Regular span header.
 struct regular_span
 {
 	struct span_header header;
+	struct regular_extent *extent;
 
 	struct node staging_node;
 	span_status_t status;
@@ -778,7 +775,7 @@ struct slice_cache
 
 	/* Statistics. */
 	uint64_t singular_alloc_num;
-	uint64_t _Atomic singular_free_num;
+	CACHE_ALIGN uint64_t _Atomic singular_free_num;
 
 	/* The list of chunks freed remotely. */
 	struct mpsc_queue remote_free_list;
@@ -811,6 +808,36 @@ static const uint32_t block_size[] = {
 static const uint32_t block_used[] = {
 	FIRST_ROW(BLOCK_USED),
 	BLOCK_ROWS(BLOCK_USED),
+};
+
+static spinlock_t initial_cache_lock = SPINLOCK_INIT;
+static spinlock_t cache_release_lock = SPINLOCK_INIT;
+static spinlock_t extents_lock = SPINLOCK_INIT;
+
+// The initial cache (contains other caches).
+static struct slice_cache initial_cache;
+static struct regular_extent initial_extent;
+
+static struct list full_extents = {
+	.node = {
+		.next = &full_extents.node,
+		.prev = &full_extents.node,
+	}
+};
+
+static struct list non_full_extents = {
+	.node = {
+		.next = &non_full_extents.node,
+		.prev = &non_full_extents.node,
+	}
+};
+
+// Pending cache release list.
+static struct list cache_release_list = {
+	.node = {
+		.next = &cache_release_list.node,
+		.prev = &cache_release_list.node,
+	}
 };
 
 static inline uint32_t
@@ -849,7 +876,7 @@ find_slice_info(const struct regular_span *const span, const uint32_t unit)
 		0, 0, 0, 0,
 		1, 1, 1, 1,
 		2, 2, 3, 4,
-		5, 6, 7, 8
+		5, 6, 7, 8 // the last 2 values should never be encountered
 	};
 
 	return unit - table[index];
@@ -1077,32 +1104,6 @@ split_slice(struct regular_span *const span, uint32_t base, uint32_t rank, const
 }
 
 static void
-prepare_span(struct regular_span *const span)
-{
-	// As the span comes after a fresh mmap() call there is no need
-	// to zero it out manually.
-#if 0
-	span->status = SPAN_ACTIVE;
-	span->block_num = 0;
-	span->slice_num = 0;
-
-	for (uint32_t i = 0; i < SLICE_RANKS; i++)
-		span->slices[i] = 0;
-
-	memset(span->units, 0, sizeof span->units);
-#endif
-
-	for (uint32_t i = 0; i < BLOCK_RANKS; i++)
-		list_prepare(&span->blocks[i]);
-
-	// The initial heap layout takes out the very first 4KiB slice
-	// from the span. It is used up for the very span header that is
-	// initialized here.
-	split_slice(span, 0, BLOCK_RANKS, CACHE_RANKS);
-	span->units[0] = BLOCK_RANKS;
-}
-
-static void
 coalesce_chunks(struct regular_span *const span)
 {
 	// Convert empty blocks to slices.
@@ -1172,6 +1173,116 @@ release_remote(struct slice_cache *const cache)
 	}
 }
 
+static struct regular_span *
+create_regular(struct slice_cache *const cache)
+{
+	const bool is_initial_cache = (cache == &initial_cache);
+
+	spin_lock(&extents_lock);
+	if (list_empty(&non_full_extents)) {
+		struct regular_extent *extent;
+		if (!is_initial_cache) {
+			spin_unlock(&extents_lock);
+
+			spin_lock(&initial_cache_lock);
+			extent = slice_cache_alloc(&initial_cache, sizeof(struct regular_extent));
+			if (unlikely(extent == NULL)) {
+				spin_unlock(&initial_cache_lock);
+				return NULL;
+			}
+
+			spin_lock(&extents_lock);
+		} else {
+			extent = &initial_extent;
+		}
+
+		if (!list_empty(&non_full_extents)) {
+			if (!is_initial_cache) {
+				slice_cache_free(&initial_cache, extent);
+				spin_unlock(&initial_cache_lock);
+			}
+		} else {
+			void *space = span_alloc_space(64 * SPAN_REGULAR_SIZE, SPAN_ALIGNMENT_MASK);
+			if (unlikely(space == NULL)) {
+				spin_unlock(&extents_lock);
+				if (!is_initial_cache) {
+					slice_cache_free(&initial_cache, extent);
+					spin_unlock(&initial_cache_lock);
+				}
+				return NULL;
+			}
+
+			if (!is_initial_cache)
+				spin_unlock(&initial_cache_lock);
+
+			extent->base = space;
+			extent->free = ~((uint64_t) 0);
+			list_insert_first(&non_full_extents, &extent->node);
+		}
+	}
+
+	struct node *const node = list_head(&non_full_extents);
+	struct regular_extent *const extent = containerof(node, struct regular_extent, node);
+	const size_t span_index = ctz(extent->free);
+
+	extent->free ^= ((uint64_t) 1u) << span_index;
+	if (extent->free == 0) {
+		list_delete(node);
+		list_insert_first(&full_extents, node);
+	}
+	spin_unlock(&extents_lock);
+
+	struct regular_span *span = (struct regular_span *) (extent->base + span_index * SPAN_REGULAR_SIZE);
+	span->header.tag_or_size = SPAN_REGULAR_TAG;
+	span->header.cache = cache;
+	span->extent = extent;
+
+	// As the span comes after a fresh mmap() call there is no need
+	// to zero it out manually.
+#if 0
+	span->status = SPAN_ACTIVE;
+	span->block_num = 0;
+	span->slice_num = 0;
+
+	for (uint32_t i = 0; i < SLICE_RANKS; i++)
+		span->slices[i] = 0;
+
+	memset(span->units, 0, sizeof span->units);
+#endif
+
+	for (uint32_t i = 0; i < BLOCK_RANKS; i++)
+		list_prepare(&span->blocks[i]);
+
+	// The initial heap layout takes out the very first 4KiB slice
+	// from the span. It is used up for the very span header that is
+	// initialized here.
+	split_slice(span, 0, BLOCK_RANKS, CACHE_RANKS);
+	span->units[0] = BLOCK_RANKS;
+
+	return span;
+}
+
+static void
+destroy_regular(struct regular_span *const span)
+{
+	struct regular_extent *const extent = span->extent;
+	madvise(span, SPAN_REGULAR_SIZE, MADV_DONTNEED);
+
+	spin_lock(&extents_lock);
+
+	if (extent->free == 0) {
+		list_delete(&extent->node);
+		list_insert_first(&non_full_extents, &extent->node);
+	}
+
+	const size_t span_index = ((uint8_t *) span - extent->base) / SPAN_REGULAR_SIZE;
+	extent->free |= ((uint64_t) 1u) << span_index;
+
+	// TODO: release totally free extents.
+
+	spin_unlock(&extents_lock);
+}
+
 static void *
 alloc_slice(struct slice_cache *const cache, const uint32_t chunk_rank)
 {
@@ -1209,13 +1320,12 @@ alloc_slice(struct slice_cache *const cache, const uint32_t chunk_rank)
 
 		// Allocate a new span if none found.
 		if (span == NULL) {
-			span = (struct regular_span *) span_create_regular(cache);
+			span = create_regular(cache);
 			if (span == NULL) {
 				// Out of memory.
 				return NULL;
 			}
 
-			prepare_span(span);
 			original_rank = find_slice(span, rank);
 			ASSERT(original_rank < CACHE_RANKS);
 		}
@@ -1393,26 +1503,8 @@ chunk_alignment(const uint32_t rank)
 	return UNIT_SIZE;
 }
 
-/**********************************************************************
- * Slice cache management.
- **********************************************************************/
-
-// The initial cache (contains other caches).
-static struct slice_cache initial_cache;
-
-static spinlock_t initial_cache_lock = SPINLOCK_INIT;
-static spinlock_t cache_release_lock = SPINLOCK_INIT;
-
-// Pending cache release list.
-static struct list cache_release_list = {
-	.node = {
-		.next = &cache_release_list.node,
-		.prev = &cache_release_list.node,
-	}
-};
-
 static bool
-cache_is_all_free(struct slice_cache *const cache)
+is_cache_empty(struct slice_cache *const cache)
 {
 	struct node *node = list_head(&cache->staging);
 	while (node != list_stub(&cache->staging)) {
@@ -1439,7 +1531,7 @@ collect_staging(struct slice_cache *const cache)
 			coalesce_chunks(span);
 		if ((span->slice_num + span->block_num) == 0) {
 			list_delete(node);
-			span_destroy(&span->header);
+			destroy_regular(span);
 		}
 		node = next;
 	}
@@ -1453,9 +1545,8 @@ prepare_cache(struct slice_cache *const cache)
 	// Initialize the remote free list.
 	mpsc_queue_prepare(&cache->remote_free_list);
 
-	cache->active = (struct regular_span *) span_create_regular(cache);
+	cache->active = create_regular(cache);
 	VERIFY(cache->active, "failed to create an initial memory span");
-	prepare_span(cache->active);
 
 	cache->singular_alloc_num = 0;
 	cache->singular_free_num = 0;
@@ -1489,8 +1580,13 @@ slice_cache_create(void)
 	spin_unlock(&initial_cache_lock);
 
 	// Initialize the cache.
-	if (cache != NULL)
+	if (cache != NULL) {
 		prepare_cache(cache);
+		if (cache->active == NULL) {
+			release_cache(cache);
+			return NULL;
+		}
+	}
 
 	return cache;
 }
@@ -1507,7 +1603,7 @@ slice_cache_destroy(struct slice_cache *cache)
 
 	// Try to free all the spans in the staging list.
 	collect_staging(cache);
-	if (cache_is_all_free(cache)) {
+	if (is_cache_empty(cache)) {
 		// If done then release the cache immediately.
 		release_cache(cache);
 	} else {
@@ -1538,7 +1634,7 @@ slice_scrap_collect(void)
 			struct slice_cache *cache = containerof(node, struct slice_cache, release_node);
 			struct node *next = node->next;
 			collect_staging(cache);
-			if (cache_is_all_free(cache)) {
+			if (is_cache_empty(cache)) {
 				list_delete(node);
 				release_cache(cache);
 			}
@@ -1577,13 +1673,13 @@ slice_cache_alloc(struct slice_cache *const cache, const size_t size)
 		return ptr;
 	} else {
 		// Handle super-large sizes.
-		struct span_header *hdr = span_create_singular(cache, size, ALIGNMENT);
-		if (unlikely(hdr == NULL)) {
+		struct singular_span *span = span_create_singular(cache, size, ALIGNMENT);
+		if (unlikely(span == NULL)) {
 			errno = ENOMEM;
 			return NULL;
 		}
 		cache->singular_alloc_num++;
-		return span_singular_data(hdr);
+		return span_singular_data(span);
 	}
 }
 
@@ -1601,13 +1697,13 @@ slice_cache_zalloc(struct slice_cache *const cache, const size_t size)
 		return ptr;
 	} else {
 		// Handle super-large sizes.
-		struct span_header *hdr = span_create_singular(cache, size, ALIGNMENT);
-		if (unlikely(hdr == NULL)) {
+		struct singular_span *span = span_create_singular(cache, size, ALIGNMENT);
+		if (unlikely(span == NULL)) {
 			errno = ENOMEM;
 			return NULL;
 		}
 		cache->singular_alloc_num++;
-		return span_singular_data(hdr);
+		return span_singular_data(span);
 	}
 }
 
@@ -1642,14 +1738,14 @@ slice_cache_aligned_alloc(struct slice_cache *const cache, const size_t alignmen
 		}
 	} else {
 		// Handle super-large sizes.
-		struct span_header *hdr = span_create_singular(cache, size,
-							       max(alignment, ALIGNMENT));
-		if (unlikely(hdr == NULL)) {
+		struct singular_span *span = span_create_singular(cache, size,
+								  max(alignment, ALIGNMENT));
+		if (unlikely(span == NULL)) {
 			errno = ENOMEM;
 			return NULL;
 		}
 		cache->singular_alloc_num++;
-		return span_singular_data(hdr);
+		return span_singular_data(span);
 	}
 
 	// Fall back to allocating a larger chunk and aligning within it.
@@ -1684,14 +1780,14 @@ slice_cache_aligned_zalloc(struct slice_cache *const cache, const size_t alignme
 		}
 	} else {
 		// Handle super-large sizes.
-		struct span_header *hdr = span_create_singular(cache, size,
-							       max(alignment, ALIGNMENT));
-		if (unlikely(hdr == NULL)) {
+		struct singular_span *span = span_create_singular(cache, size,
+								  max(alignment, ALIGNMENT));
+		if (unlikely(span == NULL)) {
 			errno = ENOMEM;
 			return NULL;
 		}
 		cache->singular_alloc_num++;
-		return span_singular_data(hdr);
+		return span_singular_data(span);
 	}
 
 	// Fall back to allocating a larger chunk and aligning within it.
@@ -1723,7 +1819,7 @@ slice_cache_realloc(struct slice_cache *const cache, void *const ptr, const size
 	struct span_header *const hdr = span_from_ptr(ptr);
 	if (span_is_singular(hdr)) {
 		// Handle super-large chunks.
-		old_size = span_singular_size(hdr);
+		old_size = span_singular_size((struct singular_span *) hdr);
 		const struct singular_span_params params = span_compute_singular(size, ALIGNMENT);
 		if (old_size == (params.virtual_size - params.offset))
 			return ptr;
@@ -1769,7 +1865,7 @@ slice_cache_free(struct slice_cache *const local_cache, void *const ptr)
 	} else {
 		// Free super-large chunks.
 		atomic_fetch_add_explicit(&hdr->cache->singular_free_num, 1, memory_order_relaxed);
-		span_destroy(hdr);
+		span_destroy_singular((struct singular_span *) hdr);
 	}
 }
 
@@ -1784,7 +1880,7 @@ slice_usable_size(const void *const ptr)
 	const struct span_header *const hdr = span_from_ptr(ptr);
 	if (span_is_singular(hdr)) {
 		// Handle a super-large chunk.
-		return span_singular_size(hdr);
+		return span_singular_size((struct singular_span *) hdr);
 	}
 
 	// Handle a chunk in a regular span.
