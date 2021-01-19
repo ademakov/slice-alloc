@@ -751,8 +751,7 @@ struct regular_span
 	uint32_t slice_num;
 	uint32_t block_num;
 
-	// Cached blocks and slices.
-	struct list blocks[BLOCK_RANKS];
+	// Cached free slices.
 	void *slices[SLICE_RANKS];
 
 	// The map of units.
@@ -772,6 +771,9 @@ struct slice_cache
 
 	/* Release list node.*/
 	struct node release_node;
+
+	// Cached blocks with free chunks.
+	struct list blocks[BLOCK_RANKS];
 
 	/* Statistics. */
 	uint64_t singular_alloc_num;
@@ -1104,15 +1106,17 @@ split_slice(struct regular_span *const span, uint32_t base, uint32_t rank, const
 }
 
 static void
-coalesce_chunks(struct regular_span *const span)
+coalesce_blocks(struct slice_cache *const cache)
 {
 	// Convert empty blocks to slices.
 	for (uint32_t rank = 0; rank < BLOCK_RANKS; rank++) {
-		struct node *node = list_head(&span->blocks[rank]);
-		while (node != list_stub(&span->blocks[rank])) {
-			struct block *block = containerof(node, struct block, node);
-			struct node *next = node->next;
+		const struct node *const stub = list_stub(&cache->blocks[rank]);
+		struct node *node = list_head(&cache->blocks[rank]);
+		while (node != stub) {
+			struct block *const block = containerof(node, struct block, node);
+			struct node *const next = node->next;
 			if (block->free_num == block->free_max) {
+				struct regular_span *span = (struct regular_span *) span_from_ptr(block);
 				const uint32_t base = unit_from_ptr(span, block);
 				span->units[base] = block_slice[rank];
 				list_delete(&block->node);
@@ -1121,8 +1125,6 @@ coalesce_chunks(struct regular_span *const span)
 			node = next;
 		}
 	}
-
-	// TODO: coalesce free slices
 }
 
 static inline void
@@ -1147,13 +1149,13 @@ free_chunk(struct regular_span *const span, void *const ptr)
 		struct block *const block = (struct block *) ((uint8_t *) span + base * UNIT_SIZE);
 		VERIFY(block->free_num < block->free_max, "double free");
 
-		// If the block was empty it becomes usable again.
-		if (block->free_num++ == 0)
-			list_insert_first(&span->blocks[rank], &block->node);
-
 		// Add the chunk to the free list.
 		*((void **) ptr) = block->free_list;
 		block->free_list = ptr;
+
+		// If the block was empty it becomes usable again.
+		if (block->free_num++ == 0)
+			list_insert_first(&span->header.cache->blocks[rank], &block->node);
 	}
 }
 
@@ -1250,9 +1252,6 @@ create_regular(struct slice_cache *const cache)
 	memset(span->units, 0, sizeof span->units);
 #endif
 
-	for (uint32_t i = 0; i < BLOCK_RANKS; i++)
-		list_prepare(&span->blocks[i]);
-
 	// The initial heap layout takes out the very first 4KiB slice
 	// from the span. It is used up for the very span header that is
 	// initialized here.
@@ -1293,7 +1292,8 @@ alloc_slice(struct slice_cache *const cache, const uint32_t chunk_rank)
 	uint32_t original_rank = find_slice(span, rank);
 	if (original_rank >= CACHE_RANKS) {
 		release_remote(cache);
-		coalesce_chunks(span);
+		coalesce_blocks(cache);
+		// TODO: coalesce free slices
 		original_rank = find_slice(span, rank);
 	}
 
@@ -1306,7 +1306,7 @@ alloc_slice(struct slice_cache *const cache, const uint32_t chunk_rank)
 			struct regular_span *next = containerof(node, struct regular_span, staging_node);
 			original_rank = find_slice(next, rank);
 			if (original_rank >= CACHE_RANKS) {
-				coalesce_chunks(next);
+				// TODO: coalesce free slices
 				original_rank = find_slice(next, rank);
 			}
 			if (original_rank < CACHE_RANKS) {
@@ -1386,9 +1386,12 @@ alloc_slice(struct slice_cache *const cache, const uint32_t chunk_rank)
 static struct block *
 alloc_block(struct slice_cache *const cache, const uint32_t rank)
 {
-	// TODO: allocating a slice may take a span from the staging list with
-	// existing blocks of the required size. Thus we allocated a slice for
-	// no reason. Fix this.
+	// Try to avoid allocation by releasing remotely freed chunks.
+	release_remote(cache);
+	if (!list_empty(&cache->blocks[rank])) {
+		struct node *node = list_head(&cache->blocks[rank]);
+		return containerof(node, struct block, node);
+	}
 
 	// Allocate a large chunk.
 	struct block *const block = alloc_slice(cache, rank);
@@ -1396,7 +1399,7 @@ alloc_block(struct slice_cache *const cache, const uint32_t rank)
 		return NULL;
 
 	// Cache the block for futher use.
-	list_insert_first(&cache->active->blocks[rank], &block->node);
+	list_insert_first(&cache->blocks[rank], &block->node);
 
 	// Total number of slots.
 	const uint32_t size = block_size[rank];
@@ -1428,11 +1431,10 @@ alloc_chunk(struct slice_cache *const cache, const uint32_t rank)
 	if (rank >= BLOCK_RANKS)
 		return alloc_slice(cache, rank);
 
-	struct block *block;
-	struct regular_span *span = cache->active;
-	if (!list_empty(&span->blocks[rank])) {
+	struct block *block = NULL;
+	if (!list_empty(&cache->blocks[rank])) {
 		// Use a cached block.
-		struct node *node = list_head(&span->blocks[rank]);
+		struct node *node = list_head(&cache->blocks[rank]);
 		block = containerof(node, struct block, node);
 	} else {
 		// Allocate a new block.
@@ -1523,12 +1525,12 @@ is_cache_empty(struct slice_cache *const cache)
 static void
 collect_staging(struct slice_cache *const cache)
 {
+	coalesce_blocks(cache);
+
 	struct node *node = list_head(&cache->staging);
 	while (node != list_stub(&cache->staging)) {
 		struct regular_span *span = containerof(node, struct regular_span, staging_node);
 		struct node *next = node->next;
-		if (span->block_num != 0)
-			coalesce_chunks(span);
 		if ((span->slice_num + span->block_num) == 0) {
 			list_delete(node);
 			destroy_regular(span);
@@ -1540,13 +1542,16 @@ collect_staging(struct slice_cache *const cache)
 static void
 prepare_cache(struct slice_cache *const cache)
 {
+	cache->active = create_regular(cache);
+	VERIFY(cache->active, "failed to create an initial memory span");
+
 	list_prepare(&cache->staging);
+
+	for (size_t i = 0; i < BLOCK_RANKS; i++)
+		list_prepare(&cache->blocks[i]);
 
 	// Initialize the remote free list.
 	mpsc_queue_prepare(&cache->remote_free_list);
-
-	cache->active = create_regular(cache);
-	VERIFY(cache->active, "failed to create an initial memory span");
 
 	cache->singular_alloc_num = 0;
 	cache->singular_free_num = 0;
