@@ -665,12 +665,6 @@ span_destroy_singular(struct singular_span *const span)
 
 */
 
-typedef enum
-{
-	SPAN_ACTIVE = 0,
-	SPAN_STAGING = 1
-} span_status_t;
-
 // The number of chunk ranks. 
 #define SMALL_RANKS		(4u)
 #define MEDIUM_RANKS		(24u)
@@ -745,14 +739,11 @@ struct regular_span
 	struct span_header header;
 	struct regular_extent *extent;
 
-	struct node staging_node;
-	span_status_t status;
-
 	uint32_t slice_num;
 	uint32_t block_num;
 
-	// Cached free slices.
-	void *slices[SLICE_RANKS];
+	// Per-cache span list node.
+	struct node staging_node;
 
 	// The map of units.
 	uint8_t units[UNIT_NUMBER];
@@ -763,10 +754,7 @@ struct regular_span
  */
 struct slice_cache
 {
-	/* The active span to allocate memory from. */
-	struct regular_span *active;
-
-	/* Inactive spans to gather freed memory. */
+	// Span list.
 	struct list staging;
 
 	/* Release list node.*/
@@ -774,6 +762,9 @@ struct slice_cache
 
 	// Cached blocks with free chunks.
 	struct list blocks[BLOCK_RANKS];
+
+	// Cached free slices.
+	void *slices[SLICE_RANKS];
 
 	/* Statistics. */
 	uint64_t singular_alloc_num;
@@ -904,26 +895,25 @@ free_slice(struct regular_span *const span, const uint32_t base, const uint32_t 
 	ASSERT(rank >= BLOCK_RANKS);
 
 	void *const ptr = (uint8_t *) span + base * UNIT_SIZE;
-	const uint32_t index = rank - BLOCK_RANKS;
-	*((void **) ptr) = span->slices[index];
-	span->slices[index] = ptr;
+	*((void **) ptr) = span->header.cache->slices[rank - BLOCK_RANKS];
+	span->header.cache->slices[rank - BLOCK_RANKS] = ptr;
 
 	span->units[base + 1] = FREE_TAG1;
 	span->units[base + 2] = FREE_TAG2;
 }
 
 static uint32_t
-find_slice(const struct regular_span *const span, uint32_t rank)
+find_slice(const struct slice_cache *const cache, uint32_t rank)
 {
 	ASSERT(rank >= BLOCK_RANKS && rank < CACHE_RANKS);
 
 	while (rank < (BLOCK_RANKS + BUDDY_RANKS)) {
-		if (span->slices[rank - BLOCK_RANKS])
+		if (cache->slices[rank - BLOCK_RANKS])
 			return rank;
 		rank += 4;
 	}
 	while (rank < CACHE_RANKS) {
-		if (span->slices[rank - BLOCK_RANKS])
+		if (cache->slices[rank - BLOCK_RANKS])
 			return rank;
 		rank += 1;
 	}
@@ -1246,9 +1236,6 @@ create_regular(struct slice_cache *const cache)
 	span->block_num = 0;
 	span->slice_num = 0;
 
-	for (uint32_t i = 0; i < SLICE_RANKS; i++)
-		span->slices[i] = 0;
-
 	memset(span->units, 0, sizeof span->units);
 #endif
 
@@ -1287,58 +1274,32 @@ alloc_slice(struct slice_cache *const cache, const uint32_t chunk_rank)
 {
 	ASSERT(chunk_rank < CACHE_RANKS);
 
-	struct regular_span *span = cache->active;
 	const uint32_t rank = chunk_rank >= BLOCK_RANKS ? chunk_rank : block_slice[chunk_rank];
-	uint32_t original_rank = find_slice(span, rank);
+	uint32_t original_rank = find_slice(cache, rank);
 	if (original_rank >= CACHE_RANKS) {
 		release_remote(cache);
 		coalesce_blocks(cache);
 		// TODO: coalesce free slices
-		original_rank = find_slice(span, rank);
-	}
 
-	if (original_rank >= CACHE_RANKS) {
-		span = NULL;
-
-		// Try to find a suitable span in the staging list.
-		struct node *node = list_head(&cache->staging);
-		while (node != list_stub(&cache->staging)) {
-			struct regular_span *next = containerof(node, struct regular_span, staging_node);
-			original_rank = find_slice(next, rank);
-			if (original_rank >= CACHE_RANKS) {
-				// TODO: coalesce free slices
-				original_rank = find_slice(next, rank);
-			}
-			if (original_rank < CACHE_RANKS) {
-				next->status = SPAN_ACTIVE;
-				list_delete(node);
-				span = next;
-				break;
-			}
-			node = node->next;
-		}
-
-		// Allocate a new span if none found.
-		if (span == NULL) {
-			span = create_regular(cache);
+		original_rank = find_slice(cache, rank);
+		if (original_rank >= CACHE_RANKS) {
+			struct regular_span *span = create_regular(cache);
 			if (span == NULL) {
 				// Out of memory.
 				return NULL;
 			}
+			list_insert_first(&cache->staging, &span->staging_node);
 
-			original_rank = find_slice(span, rank);
+			original_rank = find_slice(cache, rank);
 			ASSERT(original_rank < CACHE_RANKS);
 		}
-
-		cache->active->status = SPAN_STAGING;
-		list_insert_first(&cache->staging, &cache->active->staging_node);
-		cache->active = span;
 	}
 
 	// Remove the slice from the free list.
-	void *const ptr = span->slices[original_rank - BLOCK_RANKS];
-	span->slices[original_rank - BLOCK_RANKS] = *((void **) ptr);
+	void *const ptr = cache->slices[original_rank - BLOCK_RANKS];
+	cache->slices[original_rank - BLOCK_RANKS] = *((void **) ptr);
 
+	struct regular_span *const span = (struct regular_span *) span_from_ptr(ptr);
 	const uint32_t base = unit_from_ptr(span, ptr);
 
 	// If the slice is bigger than required then split it.
@@ -1373,7 +1334,7 @@ alloc_slice(struct slice_cache *const cache, const uint32_t chunk_rank)
 			num -= 4;
 		}
 		if (num > 0) {
-			static uint8_t tail[] = {
+			static const uint8_t tail[] = {
 				BASE_STUB4, BASE_STUB5, BASE_STUB6
 			};
 			memcpy(map, tail, num);
@@ -1539,22 +1500,28 @@ collect_staging(struct slice_cache *const cache)
 	}
 }
 
-static void
+static bool
 prepare_cache(struct slice_cache *const cache)
 {
-	cache->active = create_regular(cache);
-	VERIFY(cache->active, "failed to create an initial memory span");
+	struct regular_span *span = create_regular(cache);
+	if (unlikely(span == NULL))
+		return false;
 
 	list_prepare(&cache->staging);
+	list_insert_first(&cache->staging, &span->staging_node);
 
 	for (size_t i = 0; i < BLOCK_RANKS; i++)
 		list_prepare(&cache->blocks[i]);
+	for (uint32_t i = 0; i < SLICE_RANKS; i++)
+		cache->slices[i] = NULL;
 
 	// Initialize the remote free list.
 	mpsc_queue_prepare(&cache->remote_free_list);
 
 	cache->singular_alloc_num = 0;
 	cache->singular_free_num = 0;
+
+	return true;
 }
 
 static void
@@ -1579,15 +1546,18 @@ slice_cache_create(void)
 
 	// Allocate the cache.
 	spin_lock(&initial_cache_lock);
-	if (unlikely(initial_cache.active == NULL))
-		prepare_cache(&initial_cache);
+	if (unlikely(initial_cache.staging.node.next == NULL)) {
+		if (unlikely(!prepare_cache(&initial_cache))) {
+			spin_unlock(&initial_cache_lock);
+			return NULL;
+		}
+	}
 	cache = slice_cache_alloc(&initial_cache, sizeof(struct slice_cache));
 	spin_unlock(&initial_cache_lock);
 
 	// Initialize the cache.
-	if (cache != NULL) {
-		prepare_cache(cache);
-		if (cache->active == NULL) {
+	if (likely(cache != NULL)) {
+		if (unlikely(!prepare_cache(cache))) {
 			release_cache(cache);
 			return NULL;
 		}
@@ -1599,14 +1569,7 @@ slice_cache_create(void)
 void
 slice_cache_destroy(struct slice_cache *cache)
 {
-	// Move the active span to the staging list.
-	if (cache->active != NULL) {
-		list_insert_first(&cache->staging, &cache->active->staging_node);
-		cache->active->status = SPAN_STAGING;
-		cache->active = NULL;
-	}
-
-	// Try to free all the spans in the staging list.
+	// Try to free all the spans.
 	collect_staging(cache);
 	if (is_cache_empty(cache)) {
 		// If done then release the cache immediately.
