@@ -620,47 +620,50 @@ span_destroy_singular(struct singular_span *const span)
 
   byte 1
   ------
-  for a used slice -- base of itself, lo 6 bits
-    value >= 0x40 --  64 -- 0 1  0 0 | 0 0 0 0
-    value <= 0x7f -- 127 -- 0 1  1 1 | 1 1 1 1
-    0 1 x x | x x x x
-  [ for blocks also repeated at bytes 5, 9, ... ]
+  for a used slice
+    value == 0xa0 -- 160 -- 1 0 1 0 | 0 0 0 0
 
-  for a free slice
-    value == 0xfe -- 254
-    1 1 1 1 | 1 1 1 0
-
-  byte 2
-  ------
-  for a used slice -- base of itself, hi 5 bits
-    value >= 0x80 -- 128 -- 1 0 0 0 | 0 0 0 0
-    value <= 0x9f -- 159 -- 1 0 0 1 | 1 1 1 1
-    1 0 x x | x x x x
-  [ for blocks also repeated at bytes 6, 10, ... ]
+  for a block
+    value == 0xa1 -- 161 -- 1 0 1 0 | 0 0 0 1
+  also repeated at bytes 5, 9, ...
 
   for a free slice
     value == 0xff -- 255
     1 1 1 1 | 1 1 1 1
 
+  byte 2
+  ------
+  for a used slice -- base of itself, lo 6 bits
+    value >= 0x40 --  64 -- 0 1  0 0 | 0 0 0 0
+    value <= 0x7f -- 127 -- 0 1  1 1 | 1 1 1 1
+    0 1 x x | x x x x
+  [ for blocks also repeated at bytes 6, 10, ... ]
+
+  for a free slice
+    value == 0xfe -- 254
+    1 1 1 1 | 1 1 1 0
+
   byte 3
   ------
-  for a used slice
-    value == 0xa0 -- 160 -- 1 0 1 0 | 0 0 0 0
+  for a used slice -- base of itself, hi 5 bits
+    value >= 0x80 -- 128 -- 1 0 0 0 | 0 0 0 0
+    value <= 0x9f -- 159 -- 1 0 0 1 | 1 1 1 1
+    1 0 x x | x x x x
   [ for blocks also repeated at bytes 7, 11, ... ]
 
   byte 4*n
   --------
-  for a used slice
+  for a block
     value == 0xb0 -- 176 -- 1 0 1 1 | 0 0 0 0
 
   byte 4*n + 1
   ------------
-  for a used slice
+  for a block
     value == 0xc0 -- 192 -- 1 1 0 0 | 0 0 0 0
 
   byte 4*n + 2
   ------------
-  for a used slice
+  for a block
     value == 0xd0 -- 208 -- 1 1 0 1 | 0 0 0 0
 
 */
@@ -688,13 +691,16 @@ span_destroy_singular(struct singular_span *const span)
 
 #define BASE_LFLAG		(4u << 4u)
 #define BASE_HFLAG		(8u << 4u)
-#define BASE_STUB3		(10u << 4u)
-#define BASE_STUB4		(11u << 4u)
-#define BASE_STUB5		(12u << 4u)
-#define BASE_STUB6		(13u << 4u)
 
-#define FREE_TAG1		(254u)
-#define FREE_TAG2		(255u)
+#define TAG_USED		(10u << 4u)
+#define TAG_USED_ALIGN		(TAG_USED + 1u)
+#define TAG_USED_BLOCK		(TAG_USED + 2u)
+
+#define TAG_TAIL_1		(11u << 4u)
+#define TAG_TAIL_2		(12u << 4u)
+#define TAG_TAIL_3		(13u << 4u)
+
+#define TAG_FREE		(255u)
 
 #define FIRST_ROW(_)		_(3u, 0u), _(4u, 0u), _(5u, 0u), _(5u, 2u)
 #define OTHER_ROW(r, _)		_(r, 0u), _(r, 1u), _(r, 2u), _(r, 3u)
@@ -849,7 +855,7 @@ get_rank(size_t size)
 	return (msb << 2u) + (size >> (msb - 2u)) - 23u;
 }
 
-static inline uint32_t
+static inline size_t
 unit_from_ptr(const struct regular_span *const span, const void *ptr)
 {
 #if 0
@@ -860,16 +866,17 @@ unit_from_ptr(const struct regular_span *const span, const void *ptr)
 }
 
 static inline uint32_t
-find_slice_info(const struct regular_span *const span, const uint32_t unit)
+find_slice_info(const struct regular_span *const span, const size_t unit)
 {
-	const uint8_t index = span->units[unit] >> 4u;
+	const size_t value = span->units[unit];
+	const size_t index = value >> 4u;
 	VERIFY(index < 14u, "bad pointer");
 
 	static uint8_t table[] = {
 		0, 0, 0, 0,
-		1, 1, 1, 1,
-		2, 2, 3, 4,
-		5, 6, 7, 8 // the last 2 values should never be encountered
+		2, 2, 2, 2,
+		3, 3, 1, 4,
+		5, 6, 1, 1 // the last 2 values should never be encountered
 	};
 
 	return unit - table[index];
@@ -878,28 +885,21 @@ find_slice_info(const struct regular_span *const span, const uint32_t unit)
 static inline uint32_t
 get_slice_rank(const struct regular_span *const span, const uint32_t unit)
 {
-	return span->units[unit];
+	return *(span->units + unit);
+}
+
+static inline uint32_t
+get_slice_tag(const struct regular_span *const span, const uint32_t unit)
+{
+	return *(span->units + unit + 1u);
 }
 
 static inline uint32_t
 get_slice_base(const struct regular_span *const span, const uint32_t unit)
 {
-	const uint32_t lo = span->units[unit + 1] & UNIT_LMASK;
-	const uint32_t hi = span->units[unit + 2] & UNIT_HMASK;
+	const uint32_t lo = *(span->units + unit + 2u) & UNIT_LMASK;
+	const uint32_t hi = *(span->units + unit + 3u) & UNIT_HMASK;
 	return lo | (hi << UNIT_LBITS);
-}
-
-static void
-free_slice(struct regular_span *const span, const uint32_t base, const uint32_t rank)
-{
-	ASSERT(rank >= BLOCK_RANKS);
-
-	void *const ptr = (uint8_t *) span + base * UNIT_SIZE;
-	*((void **) ptr) = span->header.cache->slices[rank - BLOCK_RANKS];
-	span->header.cache->slices[rank - BLOCK_RANKS] = ptr;
-
-	span->units[base + 1] = FREE_TAG1;
-	span->units[base + 2] = FREE_TAG2;
 }
 
 static uint32_t
@@ -924,8 +924,12 @@ find_slice(const struct slice_cache *const cache, uint32_t rank)
 static void
 cut_one(struct regular_span *const span, const uint32_t base, const uint32_t rank)
 {
-	span->units[base] = rank;
-	free_slice(span, base, rank);
+	*(span->units + base) = rank;
+	*(span->units + base + 1u) = TAG_FREE;
+
+	void *const ptr = (uint8_t *) span + base * UNIT_SIZE;
+	*((void **) ptr) = *(span->header.cache->slices + rank - BLOCK_RANKS);
+	*(span->header.cache->slices + rank - BLOCK_RANKS) = ptr;
 }
 
 static void
@@ -1107,8 +1111,8 @@ coalesce_blocks(struct slice_cache *const cache)
 			struct node *const next = node->next;
 			if (block->free_num == block->free_max) {
 				struct regular_span *span = (struct regular_span *) span_from_ptr(block);
-				const uint32_t base = unit_from_ptr(span, block);
-				span->units[base] = block_slice[rank];
+				const size_t base = unit_from_ptr(span, block);
+				*(span->units + base) = block_slice[rank];
 				list_delete(&block->node);
 				span->block_num--;
 			}
@@ -1118,34 +1122,53 @@ coalesce_blocks(struct slice_cache *const cache)
 }
 
 static inline void
-free_chunk(struct regular_span *const span, void *const ptr)
+free_chunk(struct slice_cache *const cache, struct regular_span *const span, void *const ptr)
 {
 	// Identify the chunk.
-	const uint32_t unit = unit_from_ptr(span, ptr);
+	const size_t unit = unit_from_ptr(span, ptr);
 	const uint32_t info = find_slice_info(span, unit);
 	const uint32_t rank = get_slice_rank(span, info);
 	VERIFY(rank < CACHE_RANKS, "bad pointer");
-	const uint32_t base = get_slice_base(span, info);
-	VERIFY(base >= 4 && base < UNIT_NUMBER, "bad pointer");
-	VERIFY(span->units[base + 1] != FREE_TAG1, "double free");
 
-	if (rank >= BLOCK_RANKS) {
-		// Free a whole slice.
-		span->slice_num--;
-		free_slice(span, base, rank);
-	} else {
+	if (likely(rank < BLOCK_RANKS)) {
 		// Free a chunk from a block.
+		const uint32_t base = get_slice_base(span, info);
+		VERIFY(base >= 4 && base < UNIT_NUMBER, "bad pointer");
+		VERIFY(get_slice_tag(span, base) == TAG_USED_BLOCK, "double free");
+
 		VERIFY(span->block_num > 0, "bad pointer");
 		struct block *const block = (struct block *) ((uint8_t *) span + base * UNIT_SIZE);
 		VERIFY(block->free_num < block->free_max, "double free");
 
+		// If the block was empty it now becomes usable again.
+		if (block->free_num++ == 0)
+			list_insert_first(&cache->blocks[rank], &block->node);
+
 		// Add the chunk to the free list.
 		*((void **) ptr) = block->free_list;
 		block->free_list = ptr;
+	} else {
+		// Free a whole slice.
+		span->slice_num--;
 
-		// If the block was empty it becomes usable again.
-		if (block->free_num++ == 0)
-			list_insert_first(&span->header.cache->blocks[rank], &block->node);
+		if (likely(get_slice_tag(span, info) == TAG_USED)) {
+			*(span->units + info + 1u) = TAG_FREE;
+
+			// Add the chunk to the free list.
+			*((void **) ptr) = *(cache->slices + rank - BLOCK_RANKS);
+			*(cache->slices + rank - BLOCK_RANKS) = ptr;
+		} else {
+			// Take into account alignment.
+			const uint32_t base = get_slice_base(span, info);
+			VERIFY(base >= 4 && base < UNIT_NUMBER, "bad pointer");
+			VERIFY(get_slice_tag(span, base) == TAG_USED_ALIGN, "bad pointer");
+			*(span->units + base + 1u) = TAG_FREE;
+
+			// Add the chunk to the free list.
+			void *const ptr2 = ((uint8_t *) span + base * UNIT_SIZE);
+			*((void **) ptr2) = *(cache->slices + rank - BLOCK_RANKS);
+			*(cache->slices + rank - BLOCK_RANKS) = ptr2;
+		}
 	}
 }
 
@@ -1161,7 +1184,7 @@ release_remote(struct slice_cache *const cache)
 		ASSERT(span_is_regular(hdr));
 		ASSERT(cache == hdr->cache);
 
-		free_chunk((struct regular_span *) hdr, ptr);
+		free_chunk(cache, (struct regular_span *) hdr, ptr);
 	}
 }
 
@@ -1232,7 +1255,6 @@ create_regular(struct slice_cache *const cache)
 	// As the span comes after a fresh mmap() call there is no need
 	// to zero it out manually.
 #if 0
-	span->status = SPAN_ACTIVE;
 	span->block_num = 0;
 	span->slice_num = 0;
 
@@ -1300,31 +1322,32 @@ alloc_slice(struct slice_cache *const cache, const uint32_t chunk_rank)
 	cache->slices[original_rank - BLOCK_RANKS] = *((void **) ptr);
 
 	struct regular_span *const span = (struct regular_span *) span_from_ptr(ptr);
-	const uint32_t base = unit_from_ptr(span, ptr);
+	const size_t base = unit_from_ptr(span, ptr);
 
 	// If the slice is bigger than required then split it.
 	if (rank != original_rank)
 		split_slice(span, base, rank, original_rank);
 
-	// Make the unit map pattern.
-	const uint8_t pattern[4] = {
-		chunk_rank,
-		(base & UNIT_LMASK) + BASE_LFLAG,
-		(base >> UNIT_LBITS) + BASE_HFLAG,
-		BASE_STUB3
-	};
-
-	uint8_t *map = &span->units[base];
+	uint8_t *map = span->units + base;
 	if (chunk_rank >= BLOCK_RANKS) {
 		// The slice is to be used as such.
 		span->slice_num++;
 
 		// Fill the unit map at the start only.
-		memcpy(map, pattern, 4);
+		map[0] = chunk_rank;
+		map[1] = TAG_USED;
 
 	} else {
 		// The slice is to be used as a block.
 		span->block_num++;
+
+		// Make the unit map pattern.
+		const uint8_t pattern[4] = {
+			chunk_rank,
+			TAG_USED_BLOCK,
+			(base & UNIT_LMASK) + BASE_LFLAG,
+			(base >> UNIT_LBITS) + BASE_HFLAG,
+		};
 
 		// Fill the unit map for the whole slice.
 		uint32_t num = memory_sizes[rank] / UNIT_SIZE;
@@ -1335,7 +1358,7 @@ alloc_slice(struct slice_cache *const cache, const uint32_t chunk_rank)
 		}
 		if (num > 0) {
 			static const uint8_t tail[] = {
-				BASE_STUB4, BASE_STUB5, BASE_STUB6
+				TAG_TAIL_1, TAG_TAIL_2, TAG_TAIL_3
 			};
 			memcpy(map, tail, num);
 		}
@@ -1419,7 +1442,7 @@ static inline uint32_t
 get_chunk_rank(const struct span_header *const hdr, const void *const ptr)
 {
 	struct regular_span *const span = (struct regular_span *) hdr;
-	const uint32_t unit = unit_from_ptr(span, ptr);
+	const size_t unit = unit_from_ptr(span, ptr);
 	const uint32_t info = find_slice_info(span, unit);
 	VERIFY(info >= 4 && info < UNIT_NUMBER, "bad pointer");
 	const uint32_t rank = get_slice_rank(span, info);
@@ -1824,7 +1847,7 @@ slice_cache_free(struct slice_cache *const local_cache, void *const ptr)
 
 	if (likely(hdr->cache == local_cache) && likely(span_is_regular(hdr))) {
 		// Nice, this is a regular local free.
-		free_chunk((struct regular_span *) hdr, ptr);
+		free_chunk(local_cache, (struct regular_span *) hdr, ptr);
 	} else if (likely(span_is_regular(hdr))) {
 		// Well, this is really a remote free.
 		struct mpsc_node *const link = ptr;
