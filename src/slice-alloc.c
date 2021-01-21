@@ -772,10 +772,6 @@ struct slice_cache
 	// Cached free slices.
 	void *slices[SLICE_RANKS];
 
-	/* Statistics. */
-	uint64_t singular_alloc_num;
-	CACHE_ALIGN uint64_t _Atomic singular_free_num;
-
 	/* The list of chunks freed remotely. */
 	struct mpsc_queue remote_free_list;
 };
@@ -1501,10 +1497,6 @@ is_cache_empty(struct slice_cache *const cache)
 			return false;
 		node = node->next;
 	}
-
-	if (cache->singular_alloc_num != atomic_load_explicit(&cache->singular_free_num, memory_order_relaxed))
-		return false;
-
 	return true;
 }
 
@@ -1542,9 +1534,6 @@ prepare_cache(struct slice_cache *const cache)
 
 	// Initialize the remote free list.
 	mpsc_queue_prepare(&cache->remote_free_list);
-
-	cache->singular_alloc_num = 0;
-	cache->singular_free_num = 0;
 
 	return true;
 }
@@ -1671,7 +1660,6 @@ slice_cache_alloc(struct slice_cache *const cache, const size_t size)
 			errno = ENOMEM;
 			return NULL;
 		}
-		cache->singular_alloc_num++;
 		return span_singular_data(span);
 	}
 }
@@ -1695,7 +1683,6 @@ slice_cache_zalloc(struct slice_cache *const cache, const size_t size)
 			errno = ENOMEM;
 			return NULL;
 		}
-		cache->singular_alloc_num++;
 		return span_singular_data(span);
 	}
 }
@@ -1737,7 +1724,6 @@ slice_cache_aligned_alloc(struct slice_cache *const cache, const size_t alignmen
 			errno = ENOMEM;
 			return NULL;
 		}
-		cache->singular_alloc_num++;
 		return span_singular_data(span);
 	}
 
@@ -1779,7 +1765,6 @@ slice_cache_aligned_zalloc(struct slice_cache *const cache, const size_t alignme
 			errno = ENOMEM;
 			return NULL;
 		}
-		cache->singular_alloc_num++;
 		return span_singular_data(span);
 	}
 
@@ -1857,7 +1842,6 @@ slice_cache_free(struct slice_cache *const local_cache, void *const ptr)
 		mpsc_queue_append(&hdr->cache->remote_free_list, link);
 	} else {
 		// Free super-large chunks.
-		atomic_fetch_add_explicit(&hdr->cache->singular_free_num, 1, memory_order_relaxed);
 		span_destroy_singular((struct singular_span *) hdr);
 	}
 }
