@@ -728,7 +728,7 @@ struct block
 	void *free_list;
 	uint32_t free_num;
 	uint32_t free_max;
-	struct node node;
+	struct block *next;
 };
 
 // A group of regular spans allocated at once.
@@ -767,7 +767,7 @@ struct slice_cache
 	struct node release_node;
 
 	// Cached blocks with free chunks.
-	struct list blocks[BLOCK_RANKS];
+	struct block *blocks[BLOCK_RANKS];
 
 	// Cached free slices.
 	void *slices[SLICE_RANKS];
@@ -1104,19 +1104,22 @@ coalesce_blocks(struct slice_cache *const cache)
 {
 	// Convert empty blocks to slices.
 	for (uint32_t rank = 0; rank < BLOCK_RANKS; rank++) {
-		const struct node *const stub = list_stub(&cache->blocks[rank]);
-		struct node *node = list_head(&cache->blocks[rank]);
-		while (node != stub) {
-			struct block *const block = containerof(node, struct block, node);
-			struct node *const next = node->next;
-			if (block->free_num == block->free_max) {
-				struct regular_span *span = (struct regular_span *) span_from_ptr(block);
-				const size_t base = unit_from_ptr(span, block);
-				*(span->units + base) = block_slice[rank];
-				list_delete(&block->node);
-				span->block_num--;
+		struct block **pblock = &cache->blocks[rank];
+		while (*pblock != NULL) {
+			struct block *const block = *pblock;
+			if (block->free_num < block->free_max) {
+				pblock = &block->next;
+				continue;
 			}
-			node = next;
+
+			struct regular_span *span = (struct regular_span *) span_from_ptr(block);
+			const size_t base = unit_from_ptr(span, block);
+
+			*(span->units + base) = block_slice[rank];
+			*(span->units + base + 1u) = TAG_USED;
+			*pblock = block->next;
+
+			span->block_num--;
 		}
 	}
 }
@@ -1141,8 +1144,10 @@ free_chunk(struct slice_cache *const cache, struct regular_span *const span, voi
 		VERIFY(block->free_num < block->free_max, "double free");
 
 		// If the block was empty it now becomes usable again.
-		if (block->free_num++ == 0)
-			list_insert_first(&cache->blocks[rank], &block->node);
+		if (block->free_num++ == 0) {
+			block->next = cache->blocks[rank];
+			cache->blocks[rank] = block;
+		}
 
 		// Add the chunk to the free list.
 		*((void **) ptr) = block->free_list;
@@ -1372,10 +1377,8 @@ alloc_block(struct slice_cache *const cache, const uint32_t rank)
 {
 	// Try to avoid allocation by releasing remotely freed chunks.
 	release_remote(cache);
-	if (!list_empty(&cache->blocks[rank])) {
-		struct node *node = list_head(&cache->blocks[rank]);
-		return containerof(node, struct block, node);
-	}
+	if (cache->blocks[rank] != NULL)
+		return cache->blocks[rank];
 
 	// Allocate a large chunk.
 	struct block *const block = alloc_slice(cache, rank);
@@ -1383,7 +1386,8 @@ alloc_block(struct slice_cache *const cache, const uint32_t rank)
 		return NULL;
 
 	// Cache the block for futher use.
-	list_insert_first(&cache->blocks[rank], &block->node);
+	block->next = cache->blocks[rank];
+	cache->blocks[rank] = block;
 
 	// Total number of slots.
 	const uint32_t size = block_size[rank];
@@ -1415,25 +1419,23 @@ alloc_chunk(struct slice_cache *const cache, const uint32_t rank)
 	if (rank >= BLOCK_RANKS)
 		return alloc_slice(cache, rank);
 
-	struct block *block = NULL;
-	if (!list_empty(&cache->blocks[rank])) {
-		// Use a cached block.
-		struct node *node = list_head(&cache->blocks[rank]);
-		block = containerof(node, struct block, node);
+	// Try to use a cached block.
+	struct block *block = cache->blocks[rank];
+	if (block != NULL) {
+		// If the block becomes empty delete it from the cache.
+		if (block->free_num == 1)
+			cache->blocks[rank] = block->next;
 	} else {
 		// Allocate a new block.
 		block = alloc_block(cache, rank);
 		if (unlikely(block == NULL))
 			return NULL;
 	}
+	block->free_num--;
 
 	// Get a chunk from the free list.
 	void *ptr = block->free_list;
 	block->free_list = *((void **) ptr);
-
-	// If the block becomes empty delete it from the cache.
-	if (--(block->free_num) == 0)
-		list_delete(&block->node);
 
 	return ptr;
 }
@@ -1534,7 +1536,7 @@ prepare_cache(struct slice_cache *const cache)
 	list_insert_first(&cache->staging, &span->staging_node);
 
 	for (size_t i = 0; i < BLOCK_RANKS; i++)
-		list_prepare(&cache->blocks[i]);
+		cache->blocks[i] = NULL;
 	for (uint32_t i = 0; i < SLICE_RANKS; i++)
 		cache->slices[i] = NULL;
 
