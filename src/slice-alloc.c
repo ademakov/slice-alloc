@@ -1412,9 +1412,6 @@ alloc_block(struct slice_cache *const cache, const uint32_t rank)
 static inline void *
 alloc_chunk(struct slice_cache *const cache, const uint32_t rank)
 {
-	if (rank >= BLOCK_RANKS)
-		return alloc_slice(cache, rank);
-
 	// Try to use a cached block.
 	struct block *block = cache->blocks[rank];
 	if (block != NULL) {
@@ -1647,44 +1644,53 @@ inline void *
 slice_cache_alloc(struct slice_cache *const cache, const size_t size)
 {
 	const uint32_t rank = get_rank(size);
-	if (rank < CACHE_RANKS) {
-		// Handle small, medium, and large sizes.
+	if (likely(rank < BLOCK_RANKS)) {
+		// Handle small and medium sizes.
 		void *ptr = alloc_chunk(cache, rank);
-		if (unlikely(ptr == NULL))
-			errno = ENOMEM;
-		return ptr;
+		if (likely(ptr != NULL))
+			return ptr;
+	} else if (likely(rank < CACHE_RANKS)) {
+		// Handle large sizes.
+		void *ptr = alloc_slice(cache, rank);
+		if (likely(ptr != NULL))
+			return ptr;
 	} else {
 		// Handle super-large sizes.
 		struct singular_span *span = span_create_singular(cache, size, ALIGNMENT);
-		if (unlikely(span == NULL)) {
-			errno = ENOMEM;
-			return NULL;
-		}
-		return span_singular_data(span);
+		if (likely(span != NULL))
+			return span_singular_data(span);
 	}
+
+	errno = ENOMEM;
+	return NULL;
 }
 
 void *
 slice_cache_zalloc(struct slice_cache *const cache, const size_t size)
 {
 	const uint32_t rank = get_rank(size);
-	if (rank < CACHE_RANKS) {
+	if (likely(rank < BLOCK_RANKS)) {
 		// Handle small, medium, and large sizes.
 		void *ptr = alloc_chunk(cache, rank);
-		if (unlikely(ptr == NULL))
-			errno = ENOMEM;
-		else
+		if (likely(ptr != NULL)) {
 			memset(ptr, 0, memory_sizes[rank]);
-		return ptr;
+			return ptr;
+		}
+	} else if (likely(rank < CACHE_RANKS)) {
+		void *ptr = alloc_slice(cache, rank);
+		if (likely(ptr != NULL)) {
+			memset(ptr, 0, memory_sizes[rank]);
+			return ptr;
+		}
 	} else {
 		// Handle super-large sizes.
 		struct singular_span *span = span_create_singular(cache, size, ALIGNMENT);
-		if (unlikely(span == NULL)) {
-			errno = ENOMEM;
-			return NULL;
-		}
-		return span_singular_data(span);
+		if (likely(span != NULL))
+			return span_singular_data(span);
 	}
+
+	errno = ENOMEM;
+	return NULL;
 }
 
 void *
@@ -1711,7 +1717,9 @@ slice_cache_aligned_alloc(struct slice_cache *const cache, const size_t alignmen
 	if (rank < CACHE_RANKS) {
 		// Handle small, medium, and large sizes.
 		if (alignment <= chunk_alignment(rank)) {
-			void *ptr = alloc_chunk(cache, rank);
+			void *ptr = (rank < BLOCK_RANKS
+				     ? alloc_chunk(cache, rank)
+				     : alloc_slice(cache, rank));
 			if (unlikely(ptr == NULL))
 				errno = ENOMEM;
 			return ptr;
@@ -1750,7 +1758,9 @@ slice_cache_aligned_zalloc(struct slice_cache *const cache, const size_t alignme
 	if (rank < CACHE_RANKS) {
 		// Handle small, medium, and large sizes.
 		if (alignment <= chunk_alignment(rank)) {
-			void *ptr = alloc_chunk(cache, rank);
+			void *ptr = (rank < BLOCK_RANKS
+				     ? alloc_chunk(cache, rank)
+				     : alloc_slice(cache, rank));
 			if (unlikely(ptr == NULL))
 				errno = ENOMEM;
 			else
@@ -1899,20 +1909,44 @@ prepare_local_cache(void)
 }
 
 static struct slice_cache *
-get_local_cache(void)
+create_local_cache_noerrno(void)
 {
-	struct slice_cache *cache = local_cache;
-	if (unlikely(cache == NULL)) {
-		// Create a new local cache.
-		cache = slice_cache_create();
-		if (cache == NULL)
-			return NULL;
+	// Create a new local cache.
+	struct slice_cache *cache = slice_cache_create();
+	if (likely(cache != NULL)) {
 		local_cache = cache;
 
 		// This is only for cleanup. We don't use pthread_getspecific().
 		pthread_once(&local_cache_once, prepare_local_cache);
 		pthread_setspecific(local_cache_key, cache);
 	}
+	return cache;
+}
+
+static struct slice_cache *
+create_local_cache(void)
+{
+	struct slice_cache *cache = create_local_cache_noerrno();
+	if (unlikely(cache == NULL))
+		errno = ENOMEM;
+	return cache;
+}
+
+static inline struct slice_cache *
+get_local_cache_noerrno(void)
+{
+	struct slice_cache *cache = local_cache;
+	if (unlikely(cache == NULL))
+		cache = create_local_cache_noerrno();
+	return cache;
+}
+
+static inline struct slice_cache *
+get_local_cache(void)
+{
+	struct slice_cache *cache = local_cache;
+	if (unlikely(cache == NULL))
+		cache = create_local_cache();
 	return cache;
 }
 
@@ -1927,10 +1961,8 @@ void *
 slice_alloc(const size_t size)
 {
 	struct slice_cache *cache = get_local_cache();
-	if (unlikely(cache == NULL)) {
-		errno = ENOMEM;
+	if (unlikely(cache == NULL))
 		return NULL;
-	}
 	return slice_cache_alloc(cache, size);
 }
 
@@ -1938,10 +1970,8 @@ void *
 slice_zalloc(const size_t size)
 {
 	struct slice_cache *cache = get_local_cache();
-	if (unlikely(cache == NULL)) {
-		errno = ENOMEM;
+	if (unlikely(cache == NULL))
 		return NULL;
-	}
 	return slice_cache_zalloc(cache, size);
 }
 
@@ -1949,10 +1979,8 @@ void *
 slice_calloc(const size_t num, const size_t size)
 {
 	struct slice_cache *cache = get_local_cache();
-	if (unlikely(cache == NULL)) {
-		errno = ENOMEM;
+	if (unlikely(cache == NULL))
 		return NULL;
-	}
 	return slice_cache_calloc(cache, num, size);
 }
 
@@ -1960,10 +1988,8 @@ void *
 slice_aligned_alloc(const size_t alignment, const size_t size)
 {
 	struct slice_cache *cache = get_local_cache();
-	if (unlikely(cache == NULL)) {
-		errno = ENOMEM;
+	if (unlikely(cache == NULL))
 		return NULL;
-	}
 	return slice_cache_aligned_alloc(cache, alignment, size);
 }
 
@@ -1971,10 +1997,8 @@ void *
 slice_aligned_zalloc(const size_t alignment, const size_t size)
 {
 	struct slice_cache *cache = get_local_cache();
-	if (unlikely(cache == NULL)) {
-		errno = ENOMEM;
+	if (unlikely(cache == NULL))
 		return NULL;
-	}
 	return slice_cache_aligned_zalloc(cache, alignment, size);
 }
 
@@ -1982,10 +2006,8 @@ void *
 slice_aligned_calloc(const size_t alignment, const size_t num, const size_t size)
 {
 	struct slice_cache *cache = get_local_cache();
-	if (unlikely(cache == NULL)) {
-		errno = ENOMEM;
+	if (unlikely(cache == NULL))
 		return NULL;
-	}
 	return slice_cache_aligned_calloc(cache, alignment, num, size);
 }
 
@@ -2000,10 +2022,8 @@ slice_realloc(void *const ptr, const size_t size)
 	}
 
 	struct slice_cache *cache = get_local_cache();
-	if (unlikely(cache == NULL)) {
-		errno = ENOMEM;
+	if (unlikely(cache == NULL))
 		return NULL;
-	}
 	return slice_cache_realloc(cache, ptr, size);
 }
 
@@ -2034,10 +2054,11 @@ posix_memalign(void **pptr, size_t alignment, size_t size)
 	if (pptr == NULL || !is_valid_alignment(alignment))
 		return EINVAL;
 
-	struct slice_cache *cache = get_local_cache();
+	struct slice_cache *cache = get_local_cache_noerrno();
 	if (unlikely(cache == NULL))
 		return ENOMEM;
 
+	// TODO: do not set errno
 	void *ptr = slice_cache_aligned_alloc(cache, alignment, size);
 	if (ptr == NULL)
 		return ENOMEM;
