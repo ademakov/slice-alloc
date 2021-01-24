@@ -751,6 +751,9 @@ struct regular_span
 	// Per-cache span list node.
 	struct node staging_node;
 
+	/* The list of chunks freed remotely. */
+	struct mpsc_queue remote_free_list;
+
 	// The map of units.
 	uint8_t units[UNIT_NUMBER];
 };
@@ -771,9 +774,6 @@ struct slice_cache
 
 	// Cached free slices.
 	void *slices[SLICE_RANKS];
-
-	/* The list of chunks freed remotely. */
-	struct mpsc_queue remote_free_list;
 };
 
 #define RANK_SIZE(r, m)		((4u | (m)) << ((r) - 2u))
@@ -1174,28 +1174,34 @@ free_chunk(struct slice_cache *const cache, struct regular_span *const span, voi
 }
 
 static void
-release_remote(struct slice_cache *const cache)
+release_remote_one(struct regular_span *const span)
 {
 	for (;;) {
-		void *ptr = mpsc_queue_remove(&cache->remote_free_list);
+		void *ptr = mpsc_queue_remove(&span->remote_free_list);
 		if (ptr == NULL)
 			break;
+		free_chunk(span->header.cache, span, ptr);
+	}
+}
 
-		struct span_header *const hdr = span_from_ptr(ptr);
-		ASSERT(span_is_regular(hdr));
-		ASSERT(cache == hdr->cache);
-
-		free_chunk(cache, (struct regular_span *) hdr, ptr);
+static void
+release_remote(struct slice_cache *const cache)
+{
+	struct node *node = list_head(&cache->staging);
+	while (node != list_stub(&cache->staging)) {
+		struct regular_span *span = containerof(node, struct regular_span, staging_node);
+		release_remote_one(span);
+		node = node->next;
 	}
 }
 
 static struct regular_span *
 create_regular(struct slice_cache *const cache)
 {
-	const bool is_initial_cache = (cache == &initial_cache);
-
 	spin_lock(&extents_lock);
 	if (list_empty(&non_full_extents)) {
+		const bool is_initial_cache = (cache == &initial_cache);
+
 		struct regular_extent *extent;
 		if (!is_initial_cache) {
 			spin_unlock(&extents_lock);
@@ -1267,6 +1273,9 @@ create_regular(struct slice_cache *const cache)
 	// initialized here.
 	split_slice(span, 0, BLOCK_RANKS, CACHE_RANKS);
 	span->units[0] = BLOCK_RANKS;
+
+	// Initialize the remote free list.
+	mpsc_queue_prepare(&span->remote_free_list);
 
 	return span;
 }
@@ -1497,23 +1506,6 @@ is_cache_empty(struct slice_cache *const cache)
 	return true;
 }
 
-static void
-collect_staging(struct slice_cache *const cache)
-{
-	coalesce_blocks(cache);
-
-	struct node *node = list_head(&cache->staging);
-	while (node != list_stub(&cache->staging)) {
-		struct regular_span *span = containerof(node, struct regular_span, staging_node);
-		struct node *next = node->next;
-		if ((span->slice_num + span->block_num) == 0) {
-			list_delete(node);
-			destroy_regular(span);
-		}
-		node = next;
-	}
-}
-
 static bool
 prepare_cache(struct slice_cache *const cache)
 {
@@ -1528,9 +1520,6 @@ prepare_cache(struct slice_cache *const cache)
 		cache->blocks[i] = NULL;
 	for (uint32_t i = 0; i < SLICE_RANKS; i++)
 		cache->slices[i] = NULL;
-
-	// Initialize the remote free list.
-	mpsc_queue_prepare(&cache->remote_free_list);
 
 	return true;
 }
@@ -1581,7 +1570,7 @@ void
 slice_cache_destroy(struct slice_cache *cache)
 {
 	// Try to free all the spans.
-	collect_staging(cache);
+	slice_cache_collect(cache);
 	if (is_cache_empty(cache)) {
 		// If done then release the cache immediately.
 		release_cache(cache);
@@ -1612,7 +1601,7 @@ slice_scrap_collect(void)
 		while (node != list_stub(&list)) {
 			struct slice_cache *cache = containerof(node, struct slice_cache, release_node);
 			struct node *next = node->next;
-			collect_staging(cache);
+			slice_cache_collect(cache);
 			if (is_cache_empty(cache)) {
 				list_delete(node);
 				release_cache(cache);
@@ -1633,11 +1622,25 @@ slice_scrap_collect(void)
 void
 slice_cache_collect(struct slice_cache *const cache)
 {
-	// Check for remotely freed chunks.
-	release_remote(cache);
+	coalesce_blocks(cache);
 
-	// Try to free some spans in the staging list.
-	collect_staging(cache);
+	// Try to free some spans in the list.
+	struct node *node = list_head(&cache->staging);
+	while (node != list_stub(&cache->staging)) {
+		struct regular_span *span = containerof(node, struct regular_span, staging_node);
+		struct node *next = node->next;
+
+		// Check for remotely freed chunks.
+		release_remote_one(span);
+
+		// Destroy the span if it is empty.
+		if ((span->slice_num + span->block_num) == 0) {
+			list_delete(node);
+			destroy_regular(span);
+		}
+
+		node = next;
+	}
 }
 
 inline void *
@@ -1849,7 +1852,7 @@ slice_cache_free(struct slice_cache *const local_cache, void *const ptr)
 		// Well, this is really a remote free.
 		struct mpsc_node *const link = ptr;
 		mpsc_qlink_prepare(link);
-		mpsc_queue_append(&hdr->cache->remote_free_list, link);
+		mpsc_queue_append(&((struct regular_span *) hdr)->remote_free_list, link);
 	} else {
 		// Free super-large chunks.
 		span_destroy_singular((struct singular_span *) hdr);
