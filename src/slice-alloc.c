@@ -813,11 +813,6 @@ static const uint32_t block_used[] = {
 	BLOCK_ROWS(BLOCK_USED),
 };
 
-static spinlock_t initial_cache_lock = SPINLOCK_INIT;
-
-// The initial cache (contains other caches).
-static struct slice_cache *initial_cache;
-
 // The lock for extent lists.
 static spinlock_t extents_lock = SPINLOCK_INIT;
 
@@ -1209,7 +1204,7 @@ release_remote(struct slice_cache *const cache)
 }
 
 static struct regular_span *
-create_regular(struct slice_cache *const cache, const bool is_initial_cache)
+create_regular(struct slice_cache *const cache)
 {
 	struct regular_extent *extent;
 	struct regular_span *span;
@@ -1312,7 +1307,7 @@ alloc_slice(struct slice_cache *const cache, const uint32_t chunk_rank)
 
 		original_rank = find_slice(cache, rank);
 		if (original_rank >= CACHE_RANKS) {
-			struct regular_span *span = create_regular(cache, false);
+			struct regular_span *span = create_regular(cache);
 			if (span == NULL) {
 				// Out of memory.
 				return NULL;
@@ -1517,21 +1512,8 @@ prepare_cache(struct slice_cache *const cache, struct regular_span *const span)
 struct slice_cache *
 slice_cache_create(void)
 {
-	spin_lock(&initial_cache_lock);
-	if (unlikely(initial_cache == NULL)) {
-		struct regular_span *initial_span = create_regular(NULL, true);
-		if (unlikely(initial_span == NULL)) {
-			spin_unlock(&initial_cache_lock);
-			return NULL;
-		}
-
-		initial_cache = &initial_span->place_for_cache;
-		prepare_cache(initial_cache, initial_span);
-	}
-	spin_unlock(&initial_cache_lock);
-
 	// Allocate the original span for the cache.
-	struct regular_span *const span = create_regular(NULL, false);
+	struct regular_span *const span = create_regular(NULL);
 	if (unlikely(span == NULL))
 		return NULL;
 
@@ -1917,10 +1899,10 @@ destroy_local_cache(void *ptr)
 }
 
 static void
-destroy_initial_cache(void)
+final_cleanup(void)
 {
 	pthread_key_delete(local_cache_key);
-	slice_cache_destroy(initial_cache);
+	//slice_scrap_collect();
 }
 
 static void
@@ -1930,7 +1912,7 @@ prepare_local_cache(void)
 	pthread_key_create(&local_cache_key, destroy_local_cache);
 
 	// Register for cleanup on process exit.
-	atexit(destroy_initial_cache);
+	atexit(final_cleanup);
 }
 
 static struct slice_cache *
