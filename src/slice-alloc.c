@@ -773,10 +773,15 @@ struct regular_span
 	uint8_t units[UNIT_NUMBER];
 
 	bool contains_cache;
+	bool contains_extent;
 
 	// Reserved space for a memory cache. Some spans use it but most
 	// of them don't.
-	struct slice_cache space_for_cache;
+	struct slice_cache place_for_cache;
+
+	// Reserved space for an extent. The first span in an extent uses
+	// it while others don't.
+	struct regular_extent place_for_extent;
 };
 
 #define RANK_SIZE(r, m)		((4u | (m)) << ((r) - 2u))
@@ -809,13 +814,14 @@ static const uint32_t block_used[] = {
 };
 
 static spinlock_t initial_cache_lock = SPINLOCK_INIT;
-static spinlock_t span_release_lock = SPINLOCK_INIT;
-static spinlock_t extents_lock = SPINLOCK_INIT;
 
 // The initial cache (contains other caches).
 static struct slice_cache *initial_cache;
-static struct regular_extent initial_extent;
 
+// The lock for extent lists.
+static spinlock_t extents_lock = SPINLOCK_INIT;
+
+// The list of full regular extents.
 static struct list full_extents = {
 	.node = {
 		.next = &full_extents.node,
@@ -823,6 +829,7 @@ static struct list full_extents = {
 	}
 };
 
+// The list of regular extents with available slots.
 static struct list non_full_extents = {
 	.node = {
 		.next = &non_full_extents.node,
@@ -830,7 +837,10 @@ static struct list non_full_extents = {
 	}
 };
 
-// Pending cache release list.
+// The lock for the span release list.
+static spinlock_t span_release_lock = SPINLOCK_INIT;
+
+// The list of spans pending release.
 static struct list span_release_list = {
 	.node = {
 		.next = &span_release_list.node,
@@ -1201,64 +1211,42 @@ release_remote(struct slice_cache *const cache)
 static struct regular_span *
 create_regular(struct slice_cache *const cache, const bool is_initial_cache)
 {
+	struct regular_extent *extent;
+	struct regular_span *span;
+	bool contains_extent;
+
 	spin_lock(&extents_lock);
 	if (list_empty(&non_full_extents)) {
-		struct regular_extent *extent;
-		if (!is_initial_cache) {
-			spin_unlock(&extents_lock);
+		span = span_alloc_space(64 * SPAN_REGULAR_SIZE, SPAN_ALIGNMENT_MASK);
+		if (unlikely(span == NULL))
+			return NULL;
 
-			spin_lock(&initial_cache_lock);
-			extent = slice_cache_alloc(initial_cache, sizeof(struct regular_extent));
-			if (unlikely(extent == NULL)) {
-				spin_unlock(&initial_cache_lock);
-				return NULL;
-			}
+		extent = &span->place_for_extent;
+		extent->base = (uint8_t *) span;
+		extent->free = ~((uint64_t) 1u);
+		list_insert_first(&non_full_extents, &extent->node);
 
-			spin_lock(&extents_lock);
-		} else {
-			extent = &initial_extent;
+		contains_extent = true;
+	} else {
+		struct node *const node = list_head(&non_full_extents);
+		extent = containerof(node, struct regular_extent, node);
+
+		const size_t index = ctz(extent->free);
+		extent->free ^= ((uint64_t) 1u) << index;
+		if (extent->free == 0) {
+			list_delete(node);
+			list_insert_first(&full_extents, node);
 		}
 
-		if (!list_empty(&non_full_extents)) {
-			if (!is_initial_cache) {
-				slice_cache_free(initial_cache, extent);
-				spin_unlock(&initial_cache_lock);
-			}
-		} else {
-			void *space = span_alloc_space(64 * SPAN_REGULAR_SIZE, SPAN_ALIGNMENT_MASK);
-			if (unlikely(space == NULL)) {
-				spin_unlock(&extents_lock);
-				if (!is_initial_cache) {
-					slice_cache_free(initial_cache, extent);
-					spin_unlock(&initial_cache_lock);
-				}
-				return NULL;
-			}
-
-			if (!is_initial_cache)
-				spin_unlock(&initial_cache_lock);
-
-			extent->base = space;
-			extent->free = ~((uint64_t) 0);
-			list_insert_first(&non_full_extents, &extent->node);
-		}
-	}
-
-	struct node *const node = list_head(&non_full_extents);
-	struct regular_extent *const extent = containerof(node, struct regular_extent, node);
-	const size_t span_index = ctz(extent->free);
-
-	extent->free ^= ((uint64_t) 1u) << span_index;
-	if (extent->free == 0) {
-		list_delete(node);
-		list_insert_first(&full_extents, node);
+		span = (struct regular_span *) (extent->base + index * SPAN_REGULAR_SIZE);
+		contains_extent = false;
 	}
 	spin_unlock(&extents_lock);
 
-	struct regular_span *span = (struct regular_span *) (extent->base + span_index * SPAN_REGULAR_SIZE);
 	span->contains_cache = (cache == NULL);
+	span->contains_extent = contains_extent;
 	span->header.tag_or_size = SPAN_REGULAR_TAG;
-	span->header.cache = (span->contains_cache ? &span->space_for_cache : cache);
+	span->header.cache = (span->contains_cache ? &span->place_for_cache : cache);
 	span->extent = extent;
 
 	// As the span comes after a fresh mmap() call there is no need
@@ -1269,9 +1257,9 @@ create_regular(struct slice_cache *const cache, const bool is_initial_cache)
 
 	if (span->contains_cache) {
 		for (size_t i = 0; i < BLOCK_RANKS; i++)
-			span->space_for_cache.blocks[i] = NULL;
+			span->place_for_cache.blocks[i] = NULL;
 		for (uint32_t i = 0; i < SLICE_RANKS; i++)
-			span->space_for_cache.slices[i] = NULL;
+			span->place_for_cache.slices[i] = NULL;
 	}
 
 	memset(span->units, 0, sizeof span->units);
@@ -1537,7 +1525,7 @@ slice_cache_create(void)
 			return NULL;
 		}
 
-		initial_cache = &initial_span->space_for_cache;
+		initial_cache = &initial_span->place_for_cache;
 		prepare_cache(initial_cache, initial_span);
 	}
 	spin_unlock(&initial_cache_lock);
@@ -1548,7 +1536,7 @@ slice_cache_create(void)
 		return NULL;
 
 	// Initialize the cache inside the original span.
-	struct slice_cache *const cache = &span->space_for_cache;
+	struct slice_cache *const cache = &span->place_for_cache;
 	prepare_cache(cache, span);
 	return cache;
 }
@@ -1564,10 +1552,9 @@ slice_cache_destroy(struct slice_cache *cache)
 
 	// The original span of the cache contains the cache struct itself.
 	struct regular_span *orig = (struct regular_span *) span_from_ptr(cache);
-	const bool free_orig = ((orig->slice_num + orig->block_num) == 0);
+	const bool free_orig = ((orig->slice_num + orig->block_num + orig->contains_extent) == 0);
 	if (free_orig) {
-		// If the original span is empty then it must be destroyed
-		// on one of the following steps.
+		// If the original span is empty then it must be destroyed.
 		list_delete(&orig->staging_node);
 	} else {
 		// Demote the original span to an ordinary one as the cache
@@ -1587,7 +1574,7 @@ slice_cache_destroy(struct slice_cache *cache)
 			struct regular_span *span = containerof(node, struct regular_span, staging_node);
 			list_delete(node);
 
-			span->header.cache = &span->space_for_cache;
+			span->header.cache = &span->place_for_cache;
 			prepare_cache(span->header.cache, span);
 			list_insert_first(&list, &span->release_node);
 
@@ -1632,7 +1619,7 @@ slice_scrap_collect(void)
 			struct regular_span *span = containerof(node, struct regular_span, release_node);
 			// Check for remotely freed chunks.
 			release_remote_one(span);
-			coalesce_blocks(&span->space_for_cache);
+			coalesce_blocks(&span->place_for_cache);
 			// Destroy the span if it is empty.
 			if ((span->slice_num + span->block_num) == 0) {
 				list_delete(node);
@@ -1667,7 +1654,9 @@ slice_cache_collect(struct slice_cache *const cache)
 		release_remote_one(span);
 
 		// Destroy the span if it is empty.
-		if ((span->slice_num + span->block_num) == 0 && !span->contains_cache) {
+		if ((span->slice_num + span->block_num
+		     + span->contains_cache
+		     + span->contains_extent) == 0) {
 			list_delete(node);
 			destroy_regular(span);
 		}
