@@ -722,13 +722,13 @@ span_destroy_singular(struct singular_span *const span)
 	OTHER_ROW(19u, _),	\
 	OTHER_ROW(20u, _)
 
-// Header for a block of small or medium chunks.
-struct block
+// A node in a two-level free list.
+struct free_list_node
 {
 	void *free_list;
 	uint32_t free_num;
 	uint32_t free_max;
-	struct block *next;
+	struct free_list_node *next;
 };
 
 // A group of regular spans allocated at once.
@@ -746,10 +746,7 @@ struct slice_cache
 	struct list staging;
 
 	// Cached blocks with free chunks.
-	struct block *blocks[BLOCK_RANKS];
-
-	// Cached free slices.
-	void *slices[SLICE_RANKS];
+	struct free_list_node *free_list[CACHE_RANKS];
 };
 
 // Regular span header.
@@ -772,6 +769,11 @@ struct regular_span
 	// The map of units.
 	uint8_t units[UNIT_NUMBER];
 
+	// Free lists for every slice rank.
+	struct free_list_node slice_free_list[SLICE_RANKS];
+
+	// Flags indicating if the corresponding optional data struct is
+	// used in this span.
 	bool contains_cache;
 	bool contains_extent;
 
@@ -789,7 +791,7 @@ struct regular_span
 #define MEDIUM_SLICE(r, m)	(((r) + 1u) * 4u + (m))
 #define SMALL_BLOCK_SIZE(r, m)	(512u)
 #define MEDIUM_BLOCK_SIZE(r, m)	(64u)
-#define BLOCK_USED(r, m)	((RANK_SIZE(r, m) + sizeof(struct block) - 1) / RANK_SIZE(r, m))
+#define BLOCK_USED(r, m)	((RANK_SIZE(r, m) + sizeof(struct free_list_node) - 1) / RANK_SIZE(r, m))
 
 // Memory rank sizes.
 static const uint32_t memory_sizes[] = {
@@ -912,12 +914,12 @@ find_slice(const struct slice_cache *const cache, uint32_t rank)
 	ASSERT(rank >= BLOCK_RANKS && rank < CACHE_RANKS);
 
 	while (rank < (BLOCK_RANKS + BUDDY_RANKS)) {
-		if (cache->slices[rank - BLOCK_RANKS])
+		if (cache->free_list[rank])
 			return rank;
 		rank += 4;
 	}
 	while (rank < CACHE_RANKS) {
-		if (cache->slices[rank - BLOCK_RANKS])
+		if (cache->free_list[rank])
 			return rank;
 		rank += 1;
 	}
@@ -932,8 +934,15 @@ cut_one(struct regular_span *const span, const uint32_t base, const uint32_t ran
 	*(span->units + base + 1u) = TAG_FREE;
 
 	void *const ptr = (uint8_t *) span + base * UNIT_SIZE;
-	*((void **) ptr) = *(span->header.cache->slices + rank - BLOCK_RANKS);
-	*(span->header.cache->slices + rank - BLOCK_RANKS) = ptr;
+	struct free_list_node *const node = span->slice_free_list + rank - BLOCK_RANKS;
+
+	if (node->free_num++ == 0) {
+		node->next = span->header.cache->free_list[rank];
+		span->header.cache->free_list[rank] = node;
+	}
+
+	*((void **) ptr) = node->free_list;
+	node->free_list = ptr;
 }
 
 static void
@@ -1108,20 +1117,20 @@ coalesce_blocks(struct slice_cache *const cache)
 {
 	// Convert empty blocks to slices.
 	for (uint32_t rank = 0; rank < BLOCK_RANKS; rank++) {
-		struct block **pblock = &cache->blocks[rank];
-		while (*pblock != NULL) {
-			struct block *const block = *pblock;
-			if (block->free_num < block->free_max) {
-				pblock = &block->next;
+		struct free_list_node **pnode = &cache->free_list[rank];
+		while (*pnode != NULL) {
+			struct free_list_node *const node = *pnode;
+			if (node->free_num < node->free_max) {
+				pnode = &node->next;
 				continue;
 			}
 
-			struct regular_span *span = (struct regular_span *) span_from_ptr(block);
-			const size_t base = unit_from_ptr(span, block);
+			struct regular_span *span = (struct regular_span *) span_from_ptr(node);
+			const size_t base = unit_from_ptr(span, node);
 
 			*(span->units + base) = block_slice[rank];
 			*(span->units + base + 1u) = TAG_USED;
-			*pblock = block->next;
+			*pnode = node->next;
 
 			span->block_num--;
 		}
@@ -1129,7 +1138,7 @@ coalesce_blocks(struct slice_cache *const cache)
 }
 
 static inline void
-free_chunk(struct slice_cache *const cache, struct regular_span *const span, void *const ptr)
+free_chunk(struct slice_cache *const cache, struct regular_span *const span, void *ptr)
 {
 	// Identify the chunk.
 	const size_t unit = unit_from_ptr(span, ptr);
@@ -1137,6 +1146,7 @@ free_chunk(struct slice_cache *const cache, struct regular_span *const span, voi
 	const uint32_t rank = get_slice_rank(span, info);
 	VERIFY(rank < CACHE_RANKS, "bad pointer");
 
+	struct free_list_node *node;
 	if (likely(rank < BLOCK_RANKS)) {
 		// Free a chunk from a block.
 		const uint32_t base = get_slice_base(span, info);
@@ -1144,40 +1154,44 @@ free_chunk(struct slice_cache *const cache, struct regular_span *const span, voi
 		VERIFY(get_slice_tag(span, base) == TAG_USED_BLOCK, "double free");
 
 		VERIFY(span->block_num > 0, "bad pointer");
-		struct block *const block = (struct block *) ((uint8_t *) span + base * UNIT_SIZE);
-		VERIFY(block->free_num < block->free_max, "double free");
+		node = (struct free_list_node *) ((uint8_t *) span + base * UNIT_SIZE);
+		VERIFY(node->free_num < node->free_max, "double free");
 
-		// If the block was empty it now becomes usable again.
-		if (block->free_num++ == 0) {
-			block->next = cache->blocks[rank];
-			cache->blocks[rank] = block;
+		// If the free list was empty it now becomes usable again.
+		if (node->free_num++ == 0) {
+			node->next = cache->free_list[rank];
+			cache->free_list[rank] = node;
 		}
 
 		// Add the chunk to the free list.
-		*((void **) ptr) = block->free_list;
-		block->free_list = ptr;
+		*((void **) ptr) = node->free_list;
+		node->free_list = ptr;
 	} else {
 		// Free a whole slice.
 		span->slice_num--;
 
 		if (likely(get_slice_tag(span, info) == TAG_USED)) {
 			*(span->units + info + 1u) = TAG_FREE;
-
-			// Add the chunk to the free list.
-			*((void **) ptr) = *(cache->slices + rank - BLOCK_RANKS);
-			*(cache->slices + rank - BLOCK_RANKS) = ptr;
 		} else {
 			// Take into account alignment.
 			const uint32_t base = get_slice_base(span, info);
 			VERIFY(base >= 4 && base < UNIT_NUMBER, "bad pointer");
 			VERIFY(get_slice_tag(span, base) == TAG_USED_ALIGN, "bad pointer");
-			*(span->units + base + 1u) = TAG_FREE;
 
-			// Add the chunk to the free list.
-			void *const ptr2 = ((uint8_t *) span + base * UNIT_SIZE);
-			*((void **) ptr2) = *(cache->slices + rank - BLOCK_RANKS);
-			*(cache->slices + rank - BLOCK_RANKS) = ptr2;
+			*(span->units + base + 1u) = TAG_FREE;
+			ptr = (uint8_t *) span + base * UNIT_SIZE;
 		}
+
+		// If the free list was empty it now becomes usable again.
+		node = span->slice_free_list + rank - BLOCK_RANKS;
+		if (node->free_num++ == 0) {
+			node->next = cache->free_list[rank];
+			cache->free_list[rank] = node;
+		}
+
+		// Add the chunk to the free list.
+		*((void **) ptr) = node->free_list;
+		node->free_list = ptr;
 	}
 }
 
@@ -1319,9 +1333,13 @@ alloc_slice(struct slice_cache *const cache, const uint32_t chunk_rank)
 		}
 	}
 
-	// Remove the slice from the free list.
-	void *const ptr = cache->slices[original_rank - BLOCK_RANKS];
-	cache->slices[original_rank - BLOCK_RANKS] = *((void **) ptr);
+	struct free_list_node *node = cache->free_list[original_rank];
+	if (--(node->free_num) == 0) {
+		// Remove the span from the cache free list.
+		cache->free_list[original_rank] = node->next;
+	}
+	void *const ptr = node->free_list;
+	node->free_list = *((void **) ptr);
 
 	struct regular_span *const span = (struct regular_span *) span_from_ptr(ptr);
 	const size_t base = unit_from_ptr(span, ptr);
@@ -1369,34 +1387,34 @@ alloc_slice(struct slice_cache *const cache, const uint32_t chunk_rank)
 	return ptr;
 }
 
-static struct block *
+static struct free_list_node *
 alloc_block(struct slice_cache *const cache, const uint32_t rank)
 {
 	// Try to avoid allocation by releasing remotely freed chunks.
 	release_remote(cache);
-	if (cache->blocks[rank] != NULL)
-		return cache->blocks[rank];
+	if (cache->free_list[rank] != NULL)
+		return cache->free_list[rank];
 
 	// Allocate a large chunk.
-	struct block *const block = alloc_slice(cache, rank);
-	if (unlikely(block == NULL))
+	struct free_list_node *const node = alloc_slice(cache, rank);
+	if (unlikely(node == NULL))
 		return NULL;
 
 	// Cache the block for futher use.
-	block->next = cache->blocks[rank];
-	cache->blocks[rank] = block;
+	node->next = cache->free_list[rank];
+	cache->free_list[rank] = node;
 
 	// Total number of slots.
 	const uint32_t size = block_size[rank];
 	// Slots used for 'struct block'.
 	const uint32_t used = block_used[rank];
-	block->free_num = block->free_max = size - used;
+	node->free_num = node->free_max = size - used;
 
 	// Fill the free list.
 	const uint32_t step = memory_sizes[rank];
-	uint8_t *ptr = (uint8_t *) block + used * step;
-	uint8_t *const end = (uint8_t *) block + size * step;
-	block->free_list = ptr;
+	uint8_t *ptr = (uint8_t *) node + used * step;
+	uint8_t *const end = (uint8_t *) node + size * step;
+	node->free_list = ptr;
 	for (;;) {
 		uint8_t *const next = ptr + step;
 		if (next == end) {
@@ -1407,29 +1425,29 @@ alloc_block(struct slice_cache *const cache, const uint32_t rank)
 		ptr = next;
 	}
 
-	return block;
+	return node;
 }
 
 static inline void *
 alloc_chunk(struct slice_cache *const cache, const uint32_t rank)
 {
 	// Try to use a cached block.
-	struct block *block = cache->blocks[rank];
-	if (block != NULL) {
+	struct free_list_node *node = cache->free_list[rank];
+	if (node != NULL) {
 		// If the block becomes empty delete it from the cache.
-		if (block->free_num == 1)
-			cache->blocks[rank] = block->next;
+		if (node->free_num == 1)
+			cache->free_list[rank] = node->next;
 	} else {
 		// Allocate a new block.
-		block = alloc_block(cache, rank);
-		if (unlikely(block == NULL))
+		node = alloc_block(cache, rank);
+		if (unlikely(node == NULL))
 			return NULL;
 	}
-	block->free_num--;
+	node->free_num--;
 
 	// Get a chunk from the free list.
-	void *ptr = block->free_list;
-	block->free_list = *((void **) ptr);
+	void *ptr = node->free_list;
+	node->free_list = *((void **) ptr);
 
 	return ptr;
 }
