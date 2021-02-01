@@ -766,7 +766,7 @@ struct regular_span
 	// Global release list node.
 	struct node release_node;
 
-	/* The list of chunks freed remotely. */
+	// The list of chunks freed remotely.
 	struct mpsc_queue remote_free_list;
 
 	// The map of units.
@@ -928,9 +928,11 @@ find_slice(const struct slice_cache *const cache, uint32_t rank)
 static void
 cut_one(struct regular_span *const span, const uint32_t base, const uint32_t rank)
 {
+	// Update the unit map.
 	*(span->units + base) = rank;
 	*(span->units + base + 1u) = TAG_FREE;
 
+	// Add the slice to the free list.
 	void *const ptr = (uint8_t *) span + base * UNIT_SIZE;
 	*((void **) ptr) = *(span->header.cache->slices + rank - BLOCK_RANKS);
 	*(span->header.cache->slices + rank - BLOCK_RANKS) = ptr;
