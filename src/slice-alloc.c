@@ -1118,10 +1118,16 @@ coalesce_blocks(struct slice_cache *const cache)
 
 			struct regular_span *span = (struct regular_span *) span_from_ptr(block);
 			const size_t base = unit_from_ptr(span, block);
+			const uint32_t slice_rank = block_slice[rank];
 
-			*(span->units + base) = block_slice[rank];
-			*(span->units + base + 1u) = TAG_USED;
+			// Update the unit map.
+			*(span->units + base) = slice_rank;
+			*(span->units + base + 1u) = TAG_FREE;
 			*pblock = block->next;
+
+			// Add the chunk to the free list.
+			*((void **) block) = *(cache->slices + slice_rank - BLOCK_RANKS);
+			*(cache->slices + slice_rank - BLOCK_RANKS) = block;
 
 			span->block_num--;
 		}
