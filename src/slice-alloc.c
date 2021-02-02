@@ -1137,10 +1137,14 @@ coalesce_blocks(struct slice_cache *const cache)
 			*pnode = node->next;
 
 			// Add the chunk to the free list.
-			struct free_list_node *const list =
+			struct free_list_node *const slice_node =
 				span->slice_free_list + slice_rank - BLOCK_RANKS;
-			*((void **) node) = list->free_list;
-			list->free_list = node;
+			if (slice_node->free_num++ == 0) {
+				slice_node->next = span->header.cache->free_list[slice_rank];
+				span->header.cache->free_list[slice_rank] = slice_node;
+			}
+			*((void **) node) = slice_node->free_list;
+			slice_node->free_list = node;
 
 			span->block_num--;
 		}
