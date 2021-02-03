@@ -725,9 +725,6 @@ span_destroy_singular(struct singular_span *const span)
 // Header for a block of small or medium chunks.
 struct block
 {
-	void *free_list;
-	uint32_t free_num;
-	uint32_t free_max;
 	struct block *next;
 };
 
@@ -1367,18 +1364,18 @@ alloc_slice(struct slice_cache *const cache, const uint32_t chunk_rank)
 	return ptr;
 }
 
-static struct block *
+static bool
 alloc_block(struct slice_cache *const cache, const uint32_t rank)
 {
 	// Try to avoid allocation by releasing remotely freed chunks.
 	release_remote(cache);
 	if (cache->free_list[rank] != NULL)
-		return cache->free_list[rank];
+		return true;
 
 	// Allocate a large chunk.
 	struct block *const block = alloc_slice(cache, rank);
 	if (unlikely(block == NULL))
-		return NULL;
+		return false;
 
 #if 0
 	// Cache the block for futher use.
@@ -1390,13 +1387,12 @@ alloc_block(struct slice_cache *const cache, const uint32_t rank)
 	const uint32_t size = block_size[rank];
 	// Slots used for 'struct block'.
 	const uint32_t used = block_used[rank];
-	block->free_num = block->free_max = size - used;
 
 	// Fill the free list.
 	const uint32_t step = memory_sizes[rank];
 	uint8_t *ptr = (uint8_t *) block + used * step;
 	uint8_t *const end = (uint8_t *) block + size * step;
-	block->free_list = ptr;
+	cache->free_list[rank] = ptr;
 	for (;;) {
 		uint8_t *const next = ptr + step;
 		if (next == end) {
@@ -1407,7 +1403,7 @@ alloc_block(struct slice_cache *const cache, const uint32_t rank)
 		ptr = next;
 	}
 
-	return block;
+	return true;
 }
 
 static inline void *
@@ -1417,13 +1413,10 @@ alloc_chunk(struct slice_cache *const cache, const uint32_t rank)
 	void *ptr = cache->free_list[rank];
 	if (ptr == NULL) {
 		// Allocate a new block.
-		struct block *block = alloc_block(cache, rank);
-		if (unlikely(block == NULL))
+		if (unlikely(!alloc_block(cache, rank)))
 			return NULL;
 
-		ptr = block->free_list;
-		block->free_list = NULL;
-		block->free_num = 0;
+		ptr = cache->free_list[rank];
 	}
 	cache->free_list[rank] = *((void **) ptr);
 	return ptr;
@@ -1839,7 +1832,7 @@ slice_cache_free(struct slice_cache *const local_cache, void *const ptr)
 {
 	struct span_header *const hdr = span_from_ptr(ptr);
 	if (unlikely(hdr == NULL)) {
-		if (likely(ptr == 0))
+		if (likely(ptr == NULL))
 			return;
 		abort();
 	}
