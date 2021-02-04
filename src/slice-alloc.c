@@ -1852,7 +1852,7 @@ slice_cache_free(struct slice_cache *const local_cache, void *const ptr)
 {
 	struct span_header *const hdr = span_from_ptr(ptr);
 	if (unlikely(hdr == NULL)) {
-		if (likely(ptr == 0))
+		if (likely(ptr == NULL))
 			return;
 		abort();
 	}
