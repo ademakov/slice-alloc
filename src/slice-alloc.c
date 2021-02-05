@@ -743,7 +743,7 @@ struct regular_extent
 struct slice_cache
 {
 	// Span list.
-	struct list staging;
+	struct list spans;
 
 	// Cached blocks with free chunks.
 	struct block *blocks[BLOCK_RANKS];
@@ -762,7 +762,7 @@ struct regular_span
 	uint32_t block_num;
 
 	// Per-cache span list node.
-	struct node staging_node;
+	struct node cache_node;
 	// Global release list node.
 	struct node release_node;
 
@@ -1205,9 +1205,9 @@ release_remote_one(struct regular_span *const span)
 static void
 release_remote(struct slice_cache *const cache)
 {
-	struct node *node = list_head(&cache->staging);
-	while (node != list_stub(&cache->staging)) {
-		struct regular_span *span = containerof(node, struct regular_span, staging_node);
+	struct node *node = list_head(&cache->spans);
+	while (node != list_stub(&cache->spans)) {
+		struct regular_span *span = containerof(node, struct regular_span, cache_node);
 		release_remote_one(span);
 		node = node->next;
 	}
@@ -1351,7 +1351,7 @@ alloc_slice(struct slice_cache *const cache, const uint32_t chunk_rank)
 				// Out of memory.
 				return NULL;
 			}
-			list_insert_first(&cache->staging, &span->staging_node);
+			list_insert_first(&cache->spans, &span->cache_node);
 
 			original_rank = find_slice(cache, rank);
 			ASSERT(original_rank < CACHE_RANKS);
@@ -1527,9 +1527,9 @@ chunk_alignment(const uint32_t rank)
 static bool
 is_cache_empty(struct slice_cache *const cache)
 {
-	struct node *node = list_head(&cache->staging);
-	while (node != list_stub(&cache->staging)) {
-		struct regular_span *span = containerof(node, struct regular_span, staging_node);
+	struct node *node = list_head(&cache->spans);
+	while (node != list_stub(&cache->spans)) {
+		struct regular_span *span = containerof(node, struct regular_span, cache_node);
 		if ((span->slice_num + span->block_num) != 0)
 			return false;
 		node = node->next;
@@ -1540,8 +1540,8 @@ is_cache_empty(struct slice_cache *const cache)
 static void
 prepare_cache(struct slice_cache *const cache, struct regular_span *const span)
 {
-	list_prepare(&cache->staging);
-	list_insert_first(&cache->staging, &span->staging_node);
+	list_prepare(&cache->spans);
+	list_insert_first(&cache->spans, &span->cache_node);
 }
 
 /**********************************************************************
@@ -1576,7 +1576,7 @@ slice_cache_destroy(struct slice_cache *cache)
 	const bool free_orig = ((orig->slice_num + orig->block_num + orig->holds_extent) == 0);
 	if (free_orig) {
 		// If the original span is empty then it must be destroyed.
-		list_delete(&orig->staging_node);
+		list_delete(&orig->cache_node);
 	} else {
 		// Demote the original span to an ordinary one as the cache
 		// is being destroyed now.
@@ -1585,14 +1585,14 @@ slice_cache_destroy(struct slice_cache *cache)
 
 	// If there are some still used spans then keep them around until
 	// they become totally free.
-	if (!list_empty(&cache->staging)) {
+	if (!list_empty(&cache->spans)) {
 		struct list list;
 		list_prepare(&list);
 
-		struct node *node = list_head(&cache->staging);
-		while (node != list_stub(&cache->staging)) {
+		struct node *node = list_head(&cache->spans);
+		while (node != list_stub(&cache->spans)) {
 			struct node *const next = node->next;
-			struct regular_span *span = containerof(node, struct regular_span, staging_node);
+			struct regular_span *span = containerof(node, struct regular_span, cache_node);
 			list_delete(node);
 
 			span->header.cache = &span->place_for_cache;
@@ -1665,11 +1665,11 @@ slice_cache_collect(struct slice_cache *const cache)
 	coalesce_blocks(cache);
 
 	// Try to free some spans in the list.
-	struct node *node = list_head(&cache->staging);
-	const struct node *const stub = list_stub(&cache->staging);
+	struct node *node = list_head(&cache->spans);
+	const struct node *const stub = list_stub(&cache->spans);
 	while (node != stub) {
 		struct node *const next = node->next;
-		struct regular_span *span = containerof(node, struct regular_span, staging_node);
+		struct regular_span *span = containerof(node, struct regular_span, cache_node);
 
 		// Check for remotely freed chunks.
 		release_remote_one(span);
