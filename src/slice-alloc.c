@@ -772,15 +772,17 @@ struct regular_span
 	// The map of units.
 	uint8_t units[UNIT_NUMBER];
 
-	bool contains_cache;
-	bool contains_extent;
+	// Flags indicating if the corresponding optional data struct is
+	// occupied in this span.
+	bool holds_cache;
+	bool holds_extent;
 
-	// Reserved space for a memory cache. Some spans use it but most
-	// of them don't.
+	// Reserved space for a memory cache. The first span of a cache uses
+	// it while the rest don't.
 	struct slice_cache place_for_cache;
 
 	// Reserved space for an extent. The first span in an extent uses
-	// it while others don't.
+	// it while the rest don't.
 	struct regular_extent place_for_extent;
 };
 
@@ -1216,7 +1218,7 @@ create_regular(struct slice_cache *const cache)
 {
 	struct regular_extent *extent;
 	struct regular_span *span;
-	bool contains_extent;
+	bool holds_extent;
 
 	spin_lock(&extents_lock);
 
@@ -1227,7 +1229,7 @@ create_regular(struct slice_cache *const cache)
 		span = span_alloc_space(64 * SPAN_REGULAR_SIZE, SPAN_ALIGNMENT_MASK);
 		if (unlikely(span == NULL))
 			return NULL;
-		contains_extent = true;
+		holds_extent = true;
 
 		// Initialize the extent data.
 		extent = &span->place_for_extent;
@@ -1244,7 +1246,7 @@ create_regular(struct slice_cache *const cache)
 		const size_t index = ctz(extent->free);
 		extent->free ^= ((uint64_t) 1u) << index;
 		span = (struct regular_span *) (extent->base + index * SPAN_REGULAR_SIZE);
-		contains_extent = false;
+		holds_extent = false;
 
 		// Handle the case when the extent becomes fully used.
 		if (extent->free == 0) {
@@ -1256,10 +1258,10 @@ create_regular(struct slice_cache *const cache)
 	spin_unlock(&extents_lock);
 
 	// Initialize span's basic fields.
-	span->contains_cache = (cache == NULL);
-	span->contains_extent = contains_extent;
+	span->holds_cache = (cache == NULL);
+	span->holds_extent = holds_extent;
 	span->header.tag_or_size = SPAN_REGULAR_TAG;
-	span->header.cache = (span->contains_cache ? &span->place_for_cache : cache);
+	span->header.cache = (span->holds_cache ? &span->place_for_cache : cache);
 	span->extent = extent;
 
 	// As the span comes after a fresh mmap() call there is no need
@@ -1268,7 +1270,7 @@ create_regular(struct slice_cache *const cache)
 	span->block_num = 0;
 	span->slice_num = 0;
 
-	if (span->contains_cache) {
+	if (span->holds_cache) {
 		for (size_t i = 0; i < BLOCK_RANKS; i++)
 			span->place_for_cache.blocks[i] = NULL;
 		for (uint32_t i = 0; i < SLICE_RANKS; i++)
@@ -1298,7 +1300,7 @@ destroy_regular(struct regular_span *const span)
 	const size_t index = ((uint8_t *) span - extent->base) / SPAN_REGULAR_SIZE;
 
 	// Free the span space unless it contains the extent struct.
-	VERIFY(span->contains_extent == (index == 0), "memory corruption");
+	VERIFY(span->holds_extent == (index == 0), "memory corruption");
 	if (index != 0) {
 		if (unlikely(madvise(span, SPAN_REGULAR_SIZE, MADV_DONTNEED) < 0))
 			panic("panic: failed madvise() call\n");
@@ -1571,14 +1573,14 @@ slice_cache_destroy(struct slice_cache *cache)
 
 	// The original span of the cache contains the cache struct itself.
 	struct regular_span *orig = (struct regular_span *) span_from_ptr(cache);
-	const bool free_orig = ((orig->slice_num + orig->block_num + orig->contains_extent) == 0);
+	const bool free_orig = ((orig->slice_num + orig->block_num + orig->holds_extent) == 0);
 	if (free_orig) {
 		// If the original span is empty then it must be destroyed.
 		list_delete(&orig->staging_node);
 	} else {
 		// Demote the original span to an ordinary one as the cache
 		// is being destroyed now.
-		orig->contains_cache = false;
+		orig->holds_cache = false;
 	}
 
 	// If there are some still used spans then keep them around until
@@ -1674,8 +1676,7 @@ slice_cache_collect(struct slice_cache *const cache)
 
 		// Destroy the span if it is empty.
 		if ((span->slice_num + span->block_num
-		     + span->contains_cache
-		     + span->contains_extent) == 0) {
+		     + span->holds_cache + span->holds_extent) == 0) {
 			list_delete(node);
 			destroy_regular(span);
 		}
