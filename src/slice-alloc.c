@@ -1219,33 +1219,43 @@ create_regular(struct slice_cache *const cache)
 	bool contains_extent;
 
 	spin_lock(&extents_lock);
+
+	// Check to see if there are extents with free space.
 	if (list_empty(&non_full_extents)) {
+		// No, create a new extent. And get the span space at its
+		// start address.
 		span = span_alloc_space(64 * SPAN_REGULAR_SIZE, SPAN_ALIGNMENT_MASK);
 		if (unlikely(span == NULL))
 			return NULL;
+		contains_extent = true;
 
+		// Initialize the extent data.
 		extent = &span->place_for_extent;
 		extent->base = (uint8_t *) span;
 		extent->free = ~((uint64_t) 1u);
 		list_insert_first(&non_full_extents, &extent->node);
 
-		contains_extent = true;
 	} else {
+		// Yes, take an existing extent.
 		struct node *const node = list_head(&non_full_extents);
 		extent = containerof(node, struct regular_extent, node);
 
+		// Get some free space from it and mark it as used.
 		const size_t index = ctz(extent->free);
 		extent->free ^= ((uint64_t) 1u) << index;
+		span = (struct regular_span *) (extent->base + index * SPAN_REGULAR_SIZE);
+		contains_extent = false;
+
+		// Handle the case when the extent becomes fully used.
 		if (extent->free == 0) {
 			list_delete(node);
 			list_insert_first(&full_extents, node);
 		}
-
-		span = (struct regular_span *) (extent->base + index * SPAN_REGULAR_SIZE);
-		contains_extent = false;
 	}
+
 	spin_unlock(&extents_lock);
 
+	// Initialize span's basic fields.
 	span->contains_cache = (cache == NULL);
 	span->contains_extent = contains_extent;
 	span->header.tag_or_size = SPAN_REGULAR_TAG;
@@ -1283,22 +1293,41 @@ create_regular(struct slice_cache *const cache)
 static void
 destroy_regular(struct regular_span *const span)
 {
+	void *free_space = NULL;
 	struct regular_extent *const extent = span->extent;
-	madvise(span, SPAN_REGULAR_SIZE, MADV_DONTNEED);
+	const size_t index = ((uint8_t *) span - extent->base) / SPAN_REGULAR_SIZE;
+
+	// Free the span space unless it contains the extent struct.
+	VERIFY(span->contains_extent == (index == 0), "memory corruption");
+	if (index != 0) {
+		if (unlikely(madvise(span, SPAN_REGULAR_SIZE, MADV_DONTNEED) < 0))
+			panic("panic: failed madvise() call\n");
+	}
 
 	spin_lock(&extents_lock);
 
-	if (extent->free == 0) {
+	// A fully used extent is to become not fully used again.
+	if (extent->free == 0u) {
 		list_delete(&extent->node);
 		list_insert_first(&non_full_extents, &extent->node);
 	}
 
-	const size_t span_index = ((uint8_t *) span - extent->base) / SPAN_REGULAR_SIZE;
-	extent->free |= ((uint64_t) 1u) << span_index;
+	// Mark the span space as available for another use.
+	extent->free |= ((uint64_t) 1u) << index;
 
-	// TODO: release totally free extents.
+	// But if the extent becomes completely free then its entire space
+	// has to be released.
+	if (extent->free == ~((uint64_t) 0u)) {
+		list_delete(&extent->node);
+		free_space = extent->base;
+	}
 
 	spin_unlock(&extents_lock);
+
+	// Release the extent space as was decided above.
+	if (free_space != NULL) {
+		span_free_space(free_space, 64 * SPAN_REGULAR_SIZE);
+	}
 }
 
 static void *
