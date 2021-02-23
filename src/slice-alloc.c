@@ -1524,19 +1524,6 @@ chunk_alignment(const uint32_t rank)
 	return UNIT_SIZE;
 }
 
-static bool
-is_cache_empty(struct slice_cache *const cache)
-{
-	struct node *node = list_head(&cache->spans);
-	while (node != list_stub(&cache->spans)) {
-		struct regular_span *span = containerof(node, struct regular_span, cache_node);
-		if ((span->slice_num + span->block_num) != 0)
-			return false;
-		node = node->next;
-	}
-	return true;
-}
-
 static void
 prepare_cache(struct slice_cache *const cache, struct regular_span *const span)
 {
