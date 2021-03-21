@@ -900,11 +900,11 @@ get_slice_tag(const struct regular_span *const span, const uint32_t unit)
 	return *(span->units + unit + 1u);
 }
 
-static inline uint32_t
+static inline size_t
 get_slice_base(const struct regular_span *const span, const uint32_t unit)
 {
-	const uint32_t lo = *(span->units + unit + 2u) & UNIT_LMASK;
-	const uint32_t hi = *(span->units + unit + 3u) & UNIT_HMASK;
+	const size_t lo = *(span->units + unit + 2u) & UNIT_LMASK;
+	const size_t hi = *(span->units + unit + 3u) & UNIT_HMASK;
 	return lo | (hi << UNIT_LBITS);
 }
 
@@ -1149,7 +1149,7 @@ free_chunk(struct slice_cache *const cache, struct regular_span *const span, voi
 
 	if (likely(rank < BLOCK_RANKS)) {
 		// Free a chunk from a block.
-		const uint32_t base = get_slice_base(span, info);
+		const size_t base = get_slice_base(span, info);
 		VERIFY(base >= 4 && base < UNIT_NUMBER, "bad pointer");
 		VERIFY(get_slice_tag(span, base) == TAG_USED_BLOCK, "double free");
 
@@ -1178,7 +1178,7 @@ free_chunk(struct slice_cache *const cache, struct regular_span *const span, voi
 			*(cache->slices + rank - BLOCK_RANKS) = ptr;
 		} else {
 			// Take into account alignment.
-			const uint32_t base = get_slice_base(span, info);
+			const size_t base = get_slice_base(span, info);
 			VERIFY(base >= 4 && base < UNIT_NUMBER, "bad pointer");
 			VERIFY(get_slice_tag(span, base) == TAG_USED_ALIGN, "bad pointer");
 			*(span->units + base + 1u) = TAG_FREE;
