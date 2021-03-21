@@ -59,6 +59,8 @@
 # define TLS_ATTR		__attribute__((tls_model("initial-exec")))
 #endif
 
+#define noinline		__attribute__((noinline))
+
 #define likely(x)		__builtin_expect(!!(x), 1)
 #define unlikely(x)		__builtin_expect(!!(x), 0)
 
@@ -409,16 +411,13 @@ list_remove_first(struct list *list)
 #define SPAN_REGULAR_SIZE	SPAN_ALIGNMENT
 
 // The value that tags regular spans.
-#define SPAN_REGULAR_TAG	((size_t) 0)
+#define SPAN_SINGULAR_TAG	((uintptr_t) 1)
 
 // Span header.
 struct span_header
 {
-	// The tag for regular spans or usable size for singular spans.
-	size_t tag_or_size;
-
 	// The memory cache the span belongs to.
-	struct slice_cache *cache;
+	uintptr_t cache_or_tag;
 };
 
 // Singular span header.
@@ -426,6 +425,8 @@ struct singular_span
 {
 	struct span_header header;
 
+	// The requested size.
+	size_t size;
 	// The memory size that is actually mmap()-ed.
 	size_t virtual_size;
 	// The offset of the allocated memory chunk.
@@ -452,20 +453,20 @@ span_from_ptr(const void *ptr)
 static inline bool
 span_is_regular(const struct span_header *hdr)
 {
-	return (hdr->tag_or_size == SPAN_REGULAR_TAG);
+	return (hdr->cache_or_tag != SPAN_SINGULAR_TAG);
 }
 
 // Check to see if the span is for a single large chunk.
 static inline bool
 span_is_singular(const struct span_header *hdr)
 {
-	return (hdr->tag_or_size != SPAN_REGULAR_TAG);
+	return (hdr->cache_or_tag == SPAN_SINGULAR_TAG);
 }
 
 static inline size_t
 span_singular_size(const struct singular_span *span)
 {
-	return span->header.tag_or_size;
+	return span->size;
 }
 
 // Get the actual size of virtual memory occupied by the span.
@@ -553,7 +554,7 @@ span_compute_singular(const size_t size, const size_t alignment)
 }
 
 static struct singular_span *
-span_create_singular(struct slice_cache *const cache, const size_t size, const size_t alignment)
+span_create_singular(const size_t size, const size_t alignment)
 {
 	const struct singular_span_params params = span_compute_singular(size, alignment);
 	if (params.virtual_size == 0)
@@ -561,15 +562,15 @@ span_create_singular(struct slice_cache *const cache, const size_t size, const s
 
 	struct singular_span *span = span_alloc_space(params.virtual_size, SPAN_ALIGNMENT_MASK);
 	if (likely(span != NULL)) {
-		span->header.tag_or_size = params.virtual_size - params.offset;
-		span->header.cache = cache;
+		span->header.cache_or_tag = SPAN_SINGULAR_TAG;
+		span->size = params.virtual_size - params.offset;
 		span->virtual_size = params.virtual_size;
 		span->offset = params.offset;
 	}
 	return span;
 }
 
-static void
+static noinline void
 span_destroy_singular(struct singular_span *const span)
 {
 	span_free_space(span, span_singular_virtual_size(span));
@@ -936,8 +937,9 @@ cut_one(struct regular_span *const span, const uint32_t base, const uint32_t ran
 
 	// Add the slice to the free list.
 	void *const ptr = (uint8_t *) span + base * UNIT_SIZE;
-	*((void **) ptr) = *(span->header.cache->slices + rank - BLOCK_RANKS);
-	*(span->header.cache->slices + rank - BLOCK_RANKS) = ptr;
+	struct slice_cache *const cache = (struct slice_cache *) span->header.cache_or_tag;
+	*((void **) ptr) = *(cache->slices + rank - BLOCK_RANKS);
+	*(cache->slices + rank - BLOCK_RANKS) = ptr;
 }
 
 static void
@@ -1194,11 +1196,12 @@ free_chunk(struct slice_cache *const cache, struct regular_span *const span, voi
 static void
 release_remote_one(struct regular_span *const span)
 {
+	struct slice_cache *const cache = (struct slice_cache *) span->header.cache_or_tag;
 	for (;;) {
 		void *ptr = mpsc_queue_remove(&span->remote_free_list);
 		if (ptr == NULL)
 			break;
-		free_chunk(span->header.cache, span, ptr);
+		free_chunk(cache, span, ptr);
 	}
 }
 
@@ -1260,8 +1263,7 @@ create_regular(struct slice_cache *const cache)
 	// Initialize span's basic fields.
 	span->holds_cache = (cache == NULL);
 	span->holds_extent = holds_extent;
-	span->header.tag_or_size = SPAN_REGULAR_TAG;
-	span->header.cache = (span->holds_cache ? &span->place_for_cache : cache);
+	span->header.cache_or_tag = (uintptr_t) (span->holds_cache ? &span->place_for_cache : cache);
 	span->extent = extent;
 
 	// As the span comes after a fresh mmap() call there is no need
@@ -1582,8 +1584,8 @@ slice_cache_destroy(struct slice_cache *cache)
 			struct regular_span *span = containerof(node, struct regular_span, cache_node);
 			list_delete(node);
 
-			span->header.cache = &span->place_for_cache;
-			prepare_cache(span->header.cache, span);
+			span->header.cache_or_tag = (uintptr_t) &span->place_for_cache;
+			prepare_cache(&span->place_for_cache, span);
 			list_insert_first(&list, &span->release_node);
 
 			node = next;
@@ -1688,7 +1690,7 @@ slice_cache_alloc(struct slice_cache *const cache, const size_t size)
 			return ptr;
 	} else {
 		// Handle super-large sizes.
-		struct singular_span *span = span_create_singular(cache, size, ALIGNMENT);
+		struct singular_span *span = span_create_singular(size, ALIGNMENT);
 		if (likely(span != NULL))
 			return span_singular_data(span);
 	}
@@ -1716,7 +1718,7 @@ slice_cache_zalloc(struct slice_cache *const cache, const size_t size)
 		}
 	} else {
 		// Handle super-large sizes.
-		struct singular_span *span = span_create_singular(cache, size, ALIGNMENT);
+		struct singular_span *span = span_create_singular(size, ALIGNMENT);
 		if (likely(span != NULL))
 			return span_singular_data(span);
 	}
@@ -1758,8 +1760,7 @@ slice_cache_aligned_alloc(struct slice_cache *const cache, const size_t alignmen
 		}
 	} else {
 		// Handle super-large sizes.
-		struct singular_span *span = span_create_singular(cache, size,
-								  max(alignment, ALIGNMENT));
+		struct singular_span *span = span_create_singular(size, max(alignment, ALIGNMENT));
 		if (unlikely(span == NULL)) {
 			errno = ENOMEM;
 			return NULL;
@@ -1801,8 +1802,7 @@ slice_cache_aligned_zalloc(struct slice_cache *const cache, const size_t alignme
 		}
 	} else {
 		// Handle super-large sizes.
-		struct singular_span *span = span_create_singular(cache, size,
-								  max(alignment, ALIGNMENT));
+		struct singular_span *span = span_create_singular(size, max(alignment, ALIGNMENT));
 		if (unlikely(span == NULL)) {
 			errno = ENOMEM;
 			return NULL;
@@ -1874,7 +1874,7 @@ slice_cache_free(struct slice_cache *const local_cache, void *const ptr)
 		abort();
 	}
 
-	if (likely(hdr->cache == local_cache) && likely(span_is_regular(hdr))) {
+	if (likely(hdr->cache_or_tag == (uintptr_t) local_cache)) {
 		// Nice, this is a regular local free.
 		free_chunk(local_cache, (struct regular_span *) hdr, ptr);
 	} else if (likely(span_is_regular(hdr))) {
