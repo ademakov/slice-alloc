@@ -1149,47 +1149,41 @@ free_chunk(struct slice_cache *const cache, struct regular_span *const span, voi
 	const uint32_t rank = get_slice_rank(span, info);
 	VERIFY(rank < CACHE_RANKS, "bad pointer");
 
-	if (likely(rank < BLOCK_RANKS)) {
+	const size_t base = get_slice_base(span, info);
+	VERIFY(base >= 4 && base < UNIT_NUMBER, "bad pointer");
+	void *const base_ptr = ((uint8_t *) span + base * UNIT_SIZE);
+
+	if (rank < BLOCK_RANKS) {
 		// Free a chunk from a block.
-		const size_t base = get_slice_base(span, info);
-		VERIFY(base >= 4 && base < UNIT_NUMBER, "bad pointer");
 		VERIFY(get_slice_tag(span, base) == TAG_USED_BLOCK, "double free");
-
 		VERIFY(span->block_num > 0, "bad pointer");
-		struct block *const block = (struct block *) ((uint8_t *) span + base * UNIT_SIZE);
-		VERIFY(block->free_num < block->free_max, "double free");
 
-		// If the block was empty it now becomes usable again.
-		if (block->free_num++ == 0) {
-			block->next = cache->blocks[rank];
-			cache->blocks[rank] = block;
-		}
+		struct block *const block = (struct block *) base_ptr;
+		VERIFY(block->free_num < block->free_max, "double free");
 
 		// Add the chunk to the free list.
 		*((void **) ptr) = block->free_list;
 		block->free_list = ptr;
+
+		if (block->free_num != 0) {
+			block->free_num++;
+		} else {
+			// If the block was empty it now becomes usable again.
+			block->next = cache->blocks[rank];
+			cache->blocks[rank] = block;
+			block->free_num = 1;
+		}
 	} else {
 		// Free a whole slice.
+		VERIFY(get_slice_tag(span, base) == TAG_USED ||
+		       get_slice_tag(span, base) == TAG_USED_ALIGN, "bad pointer");
+
 		span->slice_num--;
+		*(span->units + base + 1u) = TAG_FREE;
 
-		if (likely(get_slice_tag(span, info) == TAG_USED)) {
-			*(span->units + info + 1u) = TAG_FREE;
-
-			// Add the chunk to the free list.
-			*((void **) ptr) = *(cache->slices + rank - BLOCK_RANKS);
-			*(cache->slices + rank - BLOCK_RANKS) = ptr;
-		} else {
-			// Take into account alignment.
-			const size_t base = get_slice_base(span, info);
-			VERIFY(base >= 4 && base < UNIT_NUMBER, "bad pointer");
-			VERIFY(get_slice_tag(span, base) == TAG_USED_ALIGN, "bad pointer");
-			*(span->units + base + 1u) = TAG_FREE;
-
-			// Add the chunk to the free list.
-			void *const ptr2 = ((uint8_t *) span + base * UNIT_SIZE);
-			*((void **) ptr2) = *(cache->slices + rank - BLOCK_RANKS);
-			*(cache->slices + rank - BLOCK_RANKS) = ptr2;
-		}
+		// Add the chunk to the free list.
+		*((void **) base_ptr) = *(cache->slices + rank - BLOCK_RANKS);
+		*(cache->slices + rank - BLOCK_RANKS) = base_ptr;
 	}
 }
 
