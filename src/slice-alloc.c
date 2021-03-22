@@ -863,7 +863,7 @@ get_rank(size_t size)
 }
 
 static inline size_t
-unit_from_ptr(const struct regular_span *const span, const void *ptr)
+unit_from_ptr(const struct regular_span *const span, const void *const ptr)
 {
 #if 0
 	return ((uintptr_t) ptr & SPAN_ALIGNMENT_MASK) / UNIT_SIZE;
@@ -873,8 +873,10 @@ unit_from_ptr(const struct regular_span *const span, const void *ptr)
 }
 
 static inline uint32_t
-find_slice_info(const struct regular_span *const span, const size_t unit)
+find_slice_info(const struct regular_span *const span, const void *const ptr)
 {
+	const size_t unit = unit_from_ptr(span, ptr);
+
 	const size_t value = span->units[unit];
 	const size_t index = value >> 4u;
 	VERIFY(index < 14u, "bad pointer");
@@ -1144,8 +1146,7 @@ static inline void
 free_chunk(struct slice_cache *const cache, struct regular_span *const span, void *const ptr)
 {
 	// Identify the chunk.
-	const size_t unit = unit_from_ptr(span, ptr);
-	const uint32_t info = find_slice_info(span, unit);
+	const uint32_t info = find_slice_info(span, ptr);
 	const uint32_t rank = get_slice_rank(span, info);
 	VERIFY(rank < CACHE_RANKS, "bad pointer");
 
@@ -1473,8 +1474,7 @@ static inline uint32_t
 get_chunk_rank(const struct span_header *const hdr, const void *const ptr)
 {
 	struct regular_span *const span = (struct regular_span *) hdr;
-	const size_t unit = unit_from_ptr(span, ptr);
-	const uint32_t info = find_slice_info(span, unit);
+	const uint32_t info = find_slice_info(span, ptr);
 	VERIFY(info >= 4 && info < UNIT_NUMBER, "bad pointer");
 	const uint32_t rank = get_slice_rank(span, info);
 	VERIFY(rank < CACHE_RANKS, "bad pointer");
