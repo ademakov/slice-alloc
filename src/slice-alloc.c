@@ -743,11 +743,11 @@ struct regular_extent
 // A memory allocation cache.
 struct slice_cache
 {
-	// Span list.
-	struct list spans;
-
 	// Cached free chunks.
 	void *free_list[CACHE_RANKS];
+
+	// Span list.
+	struct list spans;
 };
 
 // Regular span header.
