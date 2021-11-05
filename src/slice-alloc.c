@@ -1381,12 +1381,6 @@ alloc_block(struct slice_cache *const cache, const uint32_t rank)
 	if (unlikely(block == NULL))
 		return false;
 
-#if 0
-	// Cache the block for futher use.
-	block->next = cache->free_list[rank];
-	cache->free_list[rank] = block;
-#endif
-
 	// Total number of slots.
 	const uint32_t size = block_size[rank];
 	// Slots used for 'struct block'.
