@@ -847,19 +847,21 @@ static struct list span_release_list = {
 };
 
 static inline uint32_t
-get_rank(size_t size)
+get_rank(const size_t size)
 {
-	if (size-- <= 8)
+	if (size <= 8)
 		return 0;
-	if (size < 128)
-		return (size + 16) >> 4;
+	if (size <= 127)
+		return (size + 15) >> 4;
+
+	const size_t s = size - 1;
 
 	// Search for most significant set bit, on x86 this should translate
 	// to a single BSR instruction.
-	const uint32_t msb = clz(size) ^ (nbits(size) - 1);
+	const uint32_t msb = clz(s) ^ (nbits(s) - 1u);
 
 	// Calcualte the rank.
-	return (msb << 2u) + (size >> (msb - 2u)) - 23u;
+	return (msb << 2u) + (s >> (msb - 2u)) - 23u;
 }
 
 static inline size_t
