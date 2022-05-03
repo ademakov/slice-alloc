@@ -53,11 +53,7 @@
 // CPU cache-line size.
 #define CACHE_ALIGN		__attribute__((__aligned__(64)))
 
-#if 1
-# define TLS_ATTR
-#else
-# define TLS_ATTR		__attribute__((tls_model("initial-exec")))
-#endif
+#define TLS_ATTR		__attribute__((tls_model("initial-exec")))
 
 #define noinline		__attribute__((noinline))
 
