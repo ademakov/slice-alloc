@@ -686,7 +686,7 @@ span_destroy_singular(struct singular_span *const span)
 
 */
 
-// The number of chunk ranks. 
+// The number of chunk ranks.
 #define SMALL_RANKS		(4u)
 #define MEDIUM_RANKS		(24u)
 #define SLICE_RANKS		(36u)

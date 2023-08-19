@@ -1,9 +1,29 @@
+# Various backup files
+*~
+
+# Autotools files
+.deps
+.libs
+.dirstamp
+Makefile
+Makefile.in
+/aclocal.m4
+/autom4te.cache
+/build-aux
+/configure
+/config.log
+/config.status
+/libtool
+/m4
+/src/config.h
+/src/config.h.in
+/src/stamp-h1
+
 # Prerequisites
 *.d
 
 # Object files
 *.o
-*.ko
 *.obj
 *.elf
 
@@ -41,12 +61,3 @@
 *.su
 *.idb
 *.pdb
-
-# Kernel Module Compile Results
-*.mod*
-*.cmd
-.tmp_versions/
-modules.order
-Module.symvers
-Mkfile.old
-dkms.conf
