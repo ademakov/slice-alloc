@@ -53,11 +53,7 @@
 // CPU cache-line size.
 #define CACHE_ALIGN		__attribute__((__aligned__(64)))
 
-#if 1
-# define TLS_ATTR
-#else
-# define TLS_ATTR		__attribute__((tls_model("initial-exec")))
-#endif
+#define TLS_ATTR		__attribute__((tls_model("initial-exec")))
 
 #define noinline		__attribute__((noinline))
 
@@ -386,6 +382,28 @@ list_remove_first(struct list *list)
 	return head;
 }
 
+
+/**********************************************************************
+ * Thread identification.
+ **********************************************************************/
+
+// Thread-local cache.
+static __thread struct slice_cache *local_cache TLS_ATTR = NULL;
+
+static inline uintptr_t
+get_thread_id(void)
+{
+	uintptr_t id;
+#if defined(__i386__)
+	__asm__("movl %%gs:0, %0" : "=r" (id));
+#elif defined(__x86_64__)
+	__asm__("movq %%fs:0, %0" : "=r" (id));
+#else
+	id = (uintptr_t) local_cache;
+#endif
+	return id;
+}
+
 /**********************************************************************
  * Memory spans.
  **********************************************************************/
@@ -411,13 +429,12 @@ list_remove_first(struct list *list)
 #define SPAN_REGULAR_SIZE	SPAN_ALIGNMENT
 
 // The value that tags regular spans.
-#define SPAN_SINGULAR_TAG	((uintptr_t) 1)
+#define SPAN_SINGULAR_ID	((uintptr_t) 1)
 
 // Span header.
 struct span_header
 {
-	// The memory cache the span belongs to.
-	uintptr_t cache_or_tag;
+	uintptr_t id;
 };
 
 // Singular span header.
@@ -453,14 +470,14 @@ span_from_ptr(const void *ptr)
 static inline bool
 span_is_regular(const struct span_header *hdr)
 {
-	return (hdr->cache_or_tag != SPAN_SINGULAR_TAG);
+	return (hdr->id != SPAN_SINGULAR_ID);
 }
 
 // Check to see if the span is for a single large chunk.
 static inline bool
 span_is_singular(const struct span_header *hdr)
 {
-	return (hdr->cache_or_tag == SPAN_SINGULAR_TAG);
+	return (hdr->id == SPAN_SINGULAR_ID);
 }
 
 static inline size_t
@@ -562,7 +579,7 @@ span_create_singular(const size_t size, const size_t alignment)
 
 	struct singular_span *span = span_alloc_space(params.virtual_size, SPAN_ALIGNMENT_MASK);
 	if (likely(span != NULL)) {
-		span->header.cache_or_tag = SPAN_SINGULAR_TAG;
+		span->header.id = SPAN_SINGULAR_ID;
 		span->size = params.virtual_size - params.offset;
 		span->virtual_size = params.virtual_size;
 		span->offset = params.offset;
@@ -669,7 +686,7 @@ span_destroy_singular(struct singular_span *const span)
 
 */
 
-// The number of chunk ranks. 
+// The number of chunk ranks.
 #define SMALL_RANKS		(4u)
 #define MEDIUM_RANKS		(24u)
 #define SLICE_RANKS		(36u)
@@ -754,6 +771,7 @@ struct slice_cache
 struct regular_span
 {
 	struct span_header header;
+	struct slice_cache *cache;
 	struct regular_extent *extent;
 
 	uint32_t slice_num;
@@ -844,19 +862,21 @@ static struct list span_release_list = {
 };
 
 static inline uint32_t
-get_rank(size_t size)
+get_rank(const size_t size)
 {
-	if (size-- <= 8)
+	if (size <= 8)
 		return 0;
-	if (size < 128)
-		return (size + 16) >> 4;
+	if (size <= 127)
+		return (size + 15) >> 4;
+
+	const size_t s = size - 1;
 
 	// Search for most significant set bit, on x86 this should translate
 	// to a single BSR instruction.
-	const uint32_t msb = clz(size) ^ (nbits(size) - 1);
+	const uint32_t msb = clz(s) ^ (nbits(s) - 1u);
 
 	// Calcualte the rank.
-	return (msb << 2u) + (size >> (msb - 2u)) - 23u;
+	return (msb << 2u) + (s >> (msb - 2u)) - 23u;
 }
 
 static inline size_t
@@ -935,8 +955,8 @@ cut_one(struct regular_span *const span, const uint32_t base, const uint32_t ran
 	*(span->units + base + 1u) = TAG_FREE;
 
 	// Add the slice to the free list.
+	struct slice_cache *const cache = span->cache;
 	void *const ptr = (uint8_t *) span + base * UNIT_SIZE;
-	struct slice_cache *const cache = (struct slice_cache *) span->header.cache_or_tag;
 	*((void **) ptr) = cache->free_list[rank];
 	cache->free_list[rank] = ptr;
 }
@@ -1178,7 +1198,7 @@ free_chunk(struct slice_cache *const cache, struct regular_span *const span, voi
 static void
 release_remote_one(struct regular_span *const span)
 {
-	struct slice_cache *const cache = (struct slice_cache *) span->header.cache_or_tag;
+	struct slice_cache *const cache = (struct slice_cache *) span->cache;
 	for (;;) {
 		void *ptr = mpsc_queue_remove(&span->remote_free_list);
 		if (ptr == NULL)
@@ -1245,7 +1265,12 @@ create_regular(struct slice_cache *const cache)
 	// Initialize span's basic fields.
 	span->holds_cache = (cache == NULL);
 	span->holds_extent = holds_extent;
-	span->header.cache_or_tag = (uintptr_t) (span->holds_cache ? &span->place_for_cache : cache);
+	span->header.id = get_thread_id();
+	if (span->holds_cache) {
+		span->cache = &span->place_for_cache;
+	} else {
+		span->cache = cache;
+	}
 	span->extent = extent;
 
 	// As the span comes after a fresh mmap() call there is no need
@@ -1551,7 +1576,8 @@ slice_cache_destroy(struct slice_cache *cache)
 			struct regular_span *span = containerof(node, struct regular_span, cache_node);
 			list_delete(node);
 
-			span->header.cache_or_tag = (uintptr_t) &span->place_for_cache;
+			span->header.id = 0;
+			span->cache = &span->place_for_cache;
 			prepare_cache(&span->place_for_cache, span);
 			list_insert_first(&list, &span->release_node);
 
@@ -1831,8 +1857,8 @@ slice_cache_realloc(struct slice_cache *const cache, void *const ptr, const size
 	return new_ptr;
 }
 
-inline void
-slice_cache_free(struct slice_cache *const local_cache, void *const ptr)
+void
+slice_cache_free(struct slice_cache *const cache, void *const ptr)
 {
 	struct span_header *const hdr = span_from_ptr(ptr);
 	if (unlikely(hdr == NULL)) {
@@ -1841,16 +1867,13 @@ slice_cache_free(struct slice_cache *const local_cache, void *const ptr)
 		abort();
 	}
 
-	if (likely(hdr->cache_or_tag == (uintptr_t) local_cache)) {
-		// Nice, this is a regular local free.
-		free_chunk(local_cache, (struct regular_span *) hdr, ptr);
-	} else if (likely(span_is_regular(hdr))) {
-		// Well, this is really a remote free.
-		struct mpsc_node *const link = ptr;
-		mpsc_qlink_prepare(link);
-		mpsc_queue_append(&((struct regular_span *) hdr)->remote_free_list, link);
+	if (likely(span_is_regular(hdr))) {
+		// Free a regular chunk.
+		struct regular_span *const span = (struct regular_span *) hdr;
+		VERIFY(cache == span->cache, "Wrong cache");
+		free_chunk(cache, span, ptr);
 	} else {
-		// Free super-large chunks.
+		// Free a super-large chunk.
 		span_destroy_singular((struct singular_span *) hdr);
 	}
 }
@@ -1880,9 +1903,6 @@ slice_usable_size(const void *const ptr)
 // This is used for thread-local cache cleanup.
 static pthread_key_t local_cache_key;
 static pthread_once_t local_cache_once = PTHREAD_ONCE_INIT;
-
-// Thread-local cache.
-static __thread struct slice_cache *local_cache TLS_ATTR = NULL;
 
 static void
 destroy_local_cache(void *ptr)
@@ -2029,7 +2049,29 @@ slice_realloc(void *const ptr, const size_t size)
 void
 slice_free(void *const ptr)
 {
-	slice_cache_free(local_cache, ptr);
+	const uintptr_t id = get_thread_id();
+
+	struct span_header *const hdr = span_from_ptr(ptr);
+	if (unlikely(hdr == NULL)) {
+		if (likely(ptr == NULL))
+			return;
+		abort();
+	}
+
+	if (likely(id == hdr->id)) {
+		// Nice, this is a regular local free.
+		struct regular_span *const span = (struct regular_span *) hdr;
+		free_chunk(span->cache, span, ptr);
+	} else if (likely(span_is_regular(hdr))) {
+		// Well, this is really a remote free.
+		struct mpsc_node *const link = ptr;
+		struct regular_span *const span = (struct regular_span *) hdr;
+		mpsc_qlink_prepare(link);
+		mpsc_queue_append(&span->remote_free_list, link);
+	} else {
+		// Free super-large chunks.
+		span_destroy_singular((struct singular_span *) hdr);
+	}
 }
 
 /**********************************************************************
