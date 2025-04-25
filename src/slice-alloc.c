@@ -1724,13 +1724,14 @@ slice_cache_zalloc(struct slice_cache *const cache, const size_t size)
 {
 	const uint32_t rank = get_rank(size);
 	if (likely(rank < BLOCK_RANKS)) {
-		// Handle small, medium, and large sizes.
+		// Handle small and medium sizes.
 		void *ptr = alloc_chunk(cache, rank);
 		if (likely(ptr != NULL)) {
 			memset(ptr, 0, memory_sizes[rank]);
 			return ptr;
 		}
 	} else if (likely(rank < CACHE_RANKS)) {
+		// Handle large sizes.
 		void *ptr = alloc_slice(cache, rank);
 		if (likely(ptr != NULL)) {
 			memset(ptr, 0, memory_sizes[rank]);
